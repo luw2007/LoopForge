@@ -45,7 +45,7 @@ describe("Generated JSON Schema — top-level", () => {
 
   it("includes the PromptArtifact wire contract", () => {
     const names = Object.keys(defs);
-    assert.equal(names.length, 36, `expected 36, got ${names.length}: ${names.join(", ")}`);
+    assert.equal(names.length, 30, `expected 30, got ${names.length}: ${names.join(", ")}`);
     assert.ok(names.includes("PromptArtifact"));
   });
 });

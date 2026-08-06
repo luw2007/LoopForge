@@ -6,7 +6,8 @@
 import { createInterface } from "node:readline";
 import { SessionManager } from "./session.js";
 import { TOOL_HANDLERS, TOOL_SCHEMAS, ToolInputValidationError, validateToolInput, } from "./tools.js";
-const SERVER_INFO = { name: "loopforge-mcp", version: "2.0.0" };
+import { isRecord } from "../token-utils.js";
+const SERVER_INFO = { name: "loopforge-mcp", version: "2.0.2" };
 class JsonRpcError extends Error {
     code;
     constructor(code, message) {
@@ -14,9 +15,6 @@ class JsonRpcError extends Error {
         this.code = code;
         this.name = "JsonRpcError";
     }
-}
-function isRecord(value) {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function isJsonRpcRequest(value) {
     if (!isRecord(value))
@@ -121,11 +119,47 @@ export class McpServer {
             throw error;
         }
         const output = await handler(this.mgr, args);
-        return {
-            content: [{ type: "text", text: JSON.stringify(output) }],
-            structuredContent: output,
-            isError: typeof output.error === "string",
-        };
+        const isError = typeof output.error === "string";
+        // Extract the compiled prompt (present in start/next/resume responses).
+        // MCP content annotations signal priority to the host so it can
+        // preserve critical assistant-facing content during compaction.
+        const prompt = typeof output.prompt === "string" && output.prompt.length > 0
+            ? output.prompt
+            : null;
+        const content = [];
+        if (prompt) {
+            // Primary: the actionable prompt as raw text — no JSON wrapper so
+            // the model reads the instructions immediately.
+            content.push({
+                type: "text",
+                text: prompt,
+                annotations: { priority: 1.0, audience: ["assistant"] },
+            });
+            // Secondary: structured metadata (sessionId, round, level, warnings,
+            // enforcementAction, etc.) without the prompt.
+            const { prompt: _prompt, ...meta } = output;
+            content.push({
+                type: "text",
+                text: JSON.stringify(meta),
+                annotations: { priority: 0.3, audience: ["assistant"] },
+            });
+        }
+        else if (isError) {
+            content.push({
+                type: "text",
+                text: JSON.stringify(output),
+                annotations: { priority: 1.0, audience: ["user", "assistant"] },
+            });
+        }
+        else {
+            // Non-prompt tools (status, list, replay, health, pause)
+            content.push({
+                type: "text",
+                text: JSON.stringify(output),
+                annotations: { priority: 0.5, audience: ["assistant"] },
+            });
+        }
+        return { content, structuredContent: output, isError };
     }
 }
 //# sourceMappingURL=server.js.map

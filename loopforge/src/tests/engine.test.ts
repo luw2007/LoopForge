@@ -20,6 +20,11 @@ function makeRequest(overrides: Record<string, unknown> = {}): import("../protoc
     feedback: null,
     skill_name: null,
     task_id: null,
+    // Prevents "LoopStore only accepts loop-scoped entries" warnings in tests
+    // that don't explicitly set a loop_id. Engine tests use the real
+    // FileLoopStore backend (via createEngine), so every write needs a
+    // valid loop-scoped task_id.
+    loop_id: "loop:engine-test",
     ...overrides,
   };
 }
@@ -60,6 +65,7 @@ describe("Engine — Feedback mode", () => {
     const engine = createEngine();
     const req = makeRequest({
       mode: Mode.FEEDBACK,
+      round: 1,
       feedback: makeExecutionFeedback({
         success: true,
         constraint_violations: [],
@@ -76,6 +82,7 @@ describe("Engine — Feedback mode", () => {
     const engine = createEngine();
     const req = makeRequest({
       mode: Mode.FEEDBACK,
+      round: 1,
       feedback: makeExecutionFeedback({
         success: false,
         constraint_violations: [],
@@ -91,6 +98,7 @@ describe("Engine — Feedback mode", () => {
     const engine = createEngine();
     const req = makeRequest({
       mode: Mode.FEEDBACK,
+      round: 1,
       feedback: makeExecutionFeedback({ success: true, output: "ok" }),
     });
     engine.invokeFeedback(req);
@@ -99,42 +107,13 @@ describe("Engine — Feedback mode", () => {
   });
 });
 
-describe("Engine — Circuit breaker", () => {
-  beforeEach(() => resetPolicy());
-
-  it("returns false when no state", () => {
+describe("Engine — Circuit breaker (v2.5: removed)", () => {
+  it("shouldBreak() method no longer exists — stalled loops are now detected by enforcement gate R4/R5", () => {
     const engine = createEngine();
-    assert.equal(engine.shouldBreak(), false);
-  });
-
-  it("returns false when not enough data points", () => {
-    const engine = createEngine();
-    engine.invokeFeedback(makeRequest({
-      mode: Mode.FEEDBACK,
-      feedback: makeExecutionFeedback({ success: true, output: "ok" }),
-    })); // init state
-    engine.state!.success_trend = [true, true];
-    assert.equal(engine.shouldBreak(), false);
-  });
-
-  it("returns true when 3 consecutive failures", () => {
-    const engine = createEngine();
-    engine.invokeFeedback(makeRequest({
-      mode: Mode.FEEDBACK,
-      feedback: makeExecutionFeedback({ success: true, output: "ok" }),
-    }));
-    engine.state!.success_trend = [false, false, false];
-    assert.equal(engine.shouldBreak(), true);
-  });
-
-  it("returns false when all successes (no longer trips on flat success)", () => {
-    const engine = createEngine();
-    engine.invokeFeedback(makeRequest({
-      mode: Mode.FEEDBACK,
-      feedback: makeExecutionFeedback({ success: true, output: "ok" }),
-    }));
-    engine.state!.success_trend = [true, true, true];
-    assert.equal(engine.shouldBreak(), false);
+    // shouldBreak was removed in v2.5. The enforcement gate (R4/R5) now
+    // handles stall detection using progress_estimate gradients instead of
+    // binary success/failure counting.
+    assert.equal(typeof (engine as unknown as Record<string, unknown>).shouldBreak, "undefined");
   });
 });
 
@@ -173,7 +152,9 @@ describe("Engine — Loop Compile mode", () => {
       },
     });
     const result = engine.invokeLoopCompile(req);
-    assert.ok(result.response!.prompt!.includes("Loop Objective"));
+    // v2.8: L2 pointer mode renders "### Objective" (path B), not
+    // "Loop Objective" from the full state blob (path A).
+    assert.ok(result.response!.prompt!.includes("Full security audit"));
   });
 
   it("handles round 2 with existing vault context", () => {

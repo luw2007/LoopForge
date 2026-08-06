@@ -5,22 +5,24 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 export const DEFAULT_POLICY = {
     version: "2",
     constraints: { retire_window: 3 },
-    summary: { window: 5, health_check_interval: 1 },
-    engine: { feedback_flush_interval: 5, max_circuit_breaker: 3 },
-    runtime: {
-        max_rounds: 20,
-        round_timeout_ms: 600_000,
-        heartbeat_interval_ms: 30_000,
-        stall_grace_ms: 300_000,
-        max_consecutive_errors: 3,
-        pause_double_tap_ms: 3000,
-    },
+    summary: { window: 5, health_check_interval: 1, milestone_interval: 20, max_milestones: 10, enable_loop_synthesis: true },
+    engine: { feedback_flush_interval: 5, max_circuit_breaker: 3, max_rounds: 20, enforcement_escalation_enabled: true, backtrack_enabled: true, backtrack_max_depth: 3, backtrack_preserve_discoveries: true, drift_clarification_max_streak: 3, backtrack_auto_restore: false },
     prompt: {
         injection_mode: "adaptive",
-        full_refresh_interval: 5,
+        full_refresh_interval: 0,
         l0_max_chars: 3000,
         l1_max_chars: 7000,
         l2_max_chars: 18000,
+        l2_adaptive_enabled: true,
+        l2_adaptive_round_factor: 200,
+        l2_adaptive_milestone_factor: 1000,
+        l2_adaptive_max_chars: 40000,
+        l2_adaptive_subgoal_factor: 100,
+        l2_pointer_enabled: true,
+        max_emphasize_l2: 5,
+        max_emphasize_l1: 3,
+        max_expand_l1: 1,
+        max_confusion_points: 3,
         base_prompt_version: "2.0.0",
     },
     backend: { root_dir: ".loopforge" },
@@ -31,6 +33,19 @@ export const DEFAULT_POLICY = {
         progress_stall_threshold: 0.05,
         progress_stall_rounds: 2,
         progress_mismatch_threshold: 0.3,
+        intent_drift_threshold: 0.15,
+        criteria_dedup_threshold: 0.45,
+        subgoal_dedup_threshold: 0.6,
+        subgoal_match_threshold: 0.5,
+        subgoal_auto_in_progress_threshold: 0.4,
+        subgoal_auto_complete_threshold: 0.4,
+        constraint_match_threshold: 0.5,
+        subgoal_drift_alignment_threshold: 0.3,
+        subgoal_stale_rounds: 10,
+        max_subgoals_in_prompt: 10,
+        max_done_subgoals_in_prompt: 5,
+        constraint_inactive_rounds: 15,
+        constraint_id_enabled: true,
     },
     checkpoint: { max_carried_constraints: 10, outcome_max_chars: 200 },
     state_file: {
@@ -72,8 +87,12 @@ function deepMerge(defaults, overrides) {
             result[key] = deepMerge(current, incoming);
         }
         else if (key in result) {
-            // Unknown legacy keys are deliberately ignored at the 2.0 boundary.
             result[key] = incoming;
+        }
+        else {
+            // Warn on unknown keys — a typo like "max_round" instead of
+            // "max_rounds" would otherwise be silently ignored.
+            console.warn(`loopforge: ignoring unknown policy key "${key}". Check loop_policy.json for typos.`);
         }
     }
     return result;
@@ -95,7 +114,11 @@ export function loadPolicy(path) {
 }
 let policy = null;
 export function getPolicy(path) {
-    policy ??= loadPolicy(path);
+    // Explicit path: always (re)load from that file.
+    // No path: cache the default lookup so loadPolicy only runs once.
+    if (path)
+        return loadPolicy(path);
+    policy ??= loadPolicy();
     return policy;
 }
 export function resetPolicy() {

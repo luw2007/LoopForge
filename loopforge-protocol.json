@@ -170,6 +170,52 @@
         },
         "next_action": {
           "type": "string"
+        },
+        "completed_subtasks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "blocked_subtasks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "canceled_subtasks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "stop_reason": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "gave_up"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "blocked"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "needs_human_input"
+              ]
+            }
+          ]
+        },
+        "drift_clarification": {
+          "type": "string"
+        },
+        "prompt_requests": {
+          "$ref": "#/$defs/PromptRequests"
         }
       },
       "required": [
@@ -180,14 +226,75 @@
       ],
       "description": "Structured self-evaluation embedded in compiled prompts.\nThe agent outputs this after completing each round.\nEvery field is consumed by at least one downstream function.\n\nv1.4 (P0–P2): Three new optional fields enable cognitive evolution.\nv1.5 (P4–P5): Execution evidence, progress tracking, and self-correction."
     },
-    "CheckpointSummary": {
+    "PromptRequests": {
+      "type": "object",
+      "properties": {
+        "emphasize": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expand": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "milestones"
+                ]
+              },
+              {
+                "type": "string",
+                "enum": [
+                  "sub_goals"
+                ]
+              },
+              {
+                "type": "string",
+                "enum": [
+                  "constraint_lifecycle"
+                ]
+              },
+              {
+                "type": "string",
+                "enum": [
+                  "agent_trust"
+                ]
+              },
+              {
+                "type": "string",
+                "enum": [
+                  "progress"
+                ]
+              },
+              {
+                "type": "string",
+                "enum": [
+                  "loop_synthesis"
+                ]
+              }
+            ]
+          }
+        },
+        "confusion_points": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "v2.9: Model-expressed information needs for the next round.\nSubmitted via SelfEvaluation.prompt_requests, consumed by the\nCompiler when assembling the next prompt. Transient — each round's\nrequests apply to that round only."
+    },
+    "MilestoneSummary": {
       "type": "object",
       "properties": {
         "label": {
           "type": "string"
         },
-        "declared_at_round": {
-          "type": "number"
+        "round_range": {
+          "type": "string"
         },
         "outcome": {
           "type": "string"
@@ -203,16 +310,47 @@
           "items": {
             "type": "string"
           }
+        },
+        "progress_at_boundary": {
+          "type": "number"
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "agent_declared"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "criteria_milestone"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "auto"
+              ]
+            }
+          ]
+        },
+        "generated_at_round": {
+          "type": "number"
         }
       },
       "required": [
         "label",
-        "declared_at_round",
+        "round_range",
         "outcome",
         "carried_constraints",
-        "resolved_constraints"
+        "resolved_constraints",
+        "progress_at_boundary",
+        "kind",
+        "generated_at_round"
       ],
-      "description": "v1.10: Checkpoint summary — a compressed snapshot of loop state at a\nsubtask boundary. Declared by the Agent via self-evaluation, built by\nthe compiler. Rendered as a fixed block that survives rolling-window\neviction, so constraints and outcomes from completed subtasks remain\nvisible in later rounds."
+      "description": "v2.1: Milestone summary — a phase-boundary snapshot that survives\nrolling-window eviction. Triggered by three signals in priority order:\n\n1. agent_declared    — compression_checkpoint === true (agent marks phase complete)\n2. criteria_milestone — new success_criteria_met detected (semantic dedup)\n3. auto              — safety net after N rounds without a milestone\n\nBuilt from raw round data in vault entries — no new persistent storage.\nRendered in L2 prompts and always written to the state file."
     },
     "WorkerResult": {
       "type": "object",
@@ -385,6 +523,15 @@
           "items": {
             "type": "string"
           }
+        },
+        "milestones": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MilestoneSummary"
+          }
+        },
+        "loop_synthesis": {
+          "type": "string"
         }
       },
       "required": [
@@ -393,6 +540,142 @@
         "rounds_sampled",
         "generated_at_round"
       ]
+    },
+    "SubGoal": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "pending"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "in_progress"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "done"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "blocked"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "canceled"
+              ]
+            }
+          ]
+        },
+        "declared_at_round": {
+          "type": "number"
+        },
+        "status_changed_at_round": {
+          "type": "number"
+        },
+        "completed_at_round": {
+          "type": "number"
+        },
+        "priority": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "description",
+        "status",
+        "declared_at_round",
+        "status_changed_at_round",
+        "priority"
+      ],
+      "description": "v2.2: A structured sub-goal tracked by the compiler across rounds.\nDeclared by the agent via emerged_subtasks (string[]), managed by\nthe compiler with derived status. Never creates sub-loops — the\nagent still owns execution; the compiler only tracks state."
+    },
+    "ConstraintMeta": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "discovered_at_round": {
+          "type": "number"
+        },
+        "last_violated_at_round": {
+          "type": "number"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "hard"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "plan"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "criteria"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "discovered"
+              ]
+            }
+          ]
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "active"
+              ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "inactive"
+              ]
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "discovered_at_round",
+        "last_violated_at_round",
+        "source",
+        "status"
+      ],
+      "description": "v2.3: Per-constraint lifecycle metadata derived by the compiler.\nReconstructed each round from vault entries — no new persistence.\nDiscovered constraints without violations for N rounds are demoted\nto inactive; hard/plan/criteria constraints never auto-decay."
     },
     "TaskAlignment": {
       "type": "object",
@@ -488,6 +771,30 @@
         },
         "next_action": {
           "type": "string"
+        },
+        "completed_subtasks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "blocked_subtasks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "canceled_subtasks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "drift_clarification": {
+          "type": "string"
+        },
+        "prompt_requests": {
+          "$ref": "#/$defs/PromptRequests"
         }
       },
       "required": [
@@ -776,15 +1083,32 @@
             }
           ]
         },
-        "checkpoint_summary": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/CheckpointSummary"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "sub_goals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SubGoal"
+          }
+        },
+        "constraints_inactive": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "constraint_metadata": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConstraintMeta"
+          }
+        },
+        "agent_trust_score": {
+          "type": "number"
+        },
+        "agent_trust_trend": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
         },
         "suggested_next_task": {
           "type": "string"
@@ -887,6 +1211,12 @@
         },
         "prompt_artifact": {
           "$ref": "#/$defs/PromptArtifact"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "required": [
@@ -911,9 +1241,6 @@
         "current_version": {
           "type": "string"
         },
-        "circuit_breaker_count": {
-          "type": "number"
-        },
         "feedback_buffer": {
           "type": "array",
           "items": {
@@ -927,7 +1254,6 @@
         "call_count",
         "success_trend",
         "current_version",
-        "circuit_breaker_count",
         "feedback_buffer"
       ]
     },
@@ -950,38 +1276,6 @@
       },
       "required": [
         "status"
-      ]
-    },
-    "RuntimeStatus": {
-      "type": "string",
-      "enum": [
-        "idle",
-        "running",
-        "stopped",
-        "stalled",
-        "paused"
-      ]
-    },
-    "RoundContext": {
-      "type": "object",
-      "properties": {
-        "round": {
-          "type": "number"
-        },
-        "roundId": {
-          "type": "string"
-        },
-        "signal": {
-          "type": "string"
-        },
-        "reportProgress": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "round",
-        "signal",
-        "reportProgress"
       ]
     },
     "StopReason": {
@@ -1023,6 +1317,12 @@
               "enum": [
                 "terminate"
               ]
+            },
+            {
+              "type": "string",
+              "enum": [
+                "backtrack"
+              ]
             }
           ]
         },
@@ -1034,6 +1334,9 @@
         },
         "check": {
           "type": "string"
+        },
+        "clarification_accepted": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -1042,187 +1345,6 @@
         "fix_instructions"
       ],
       "description": "Result of round-boundary enforcement. Decides whether to accept the round,\nreject it (force the agent to redo the SAME round), or terminate the loop.\n\naccept:    round passes; proceed to next round as normal.\nreject:    agent's self-evaluation or output is invalid; the agent receives\n           a rejection prompt and must redo the same round. Round counter\n           does NOT increment.\nterminate: loop has reached an unrecoverable state; stop immediately with\n           stopReason \"enforcement_terminated\"."
-    },
-    "RoundStartInfo": {
-      "type": "object",
-      "properties": {
-        "round": {
-          "type": "number"
-        },
-        "roundId": {
-          "type": "string"
-        },
-        "level": {
-          "type": "string"
-        },
-        "prompt": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "round",
-        "level",
-        "prompt"
-      ]
-    },
-    "RoundCompleteInfo": {
-      "type": "object",
-      "properties": {
-        "round": {
-          "type": "number"
-        },
-        "roundId": {
-          "type": "string"
-        },
-        "roundSuccess": {
-          "type": "boolean"
-        },
-        "selfEval": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SelfEvaluation"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "durationMs": {
-          "type": "number"
-        }
-      },
-      "required": [
-        "round",
-        "roundSuccess",
-        "durationMs"
-      ]
-    },
-    "HeartbeatInfo": {
-      "type": "object",
-      "properties": {
-        "round": {
-          "type": "number"
-        },
-        "elapsedMs": {
-          "type": "number"
-        },
-        "sinceProgressMs": {
-          "type": "number"
-        }
-      },
-      "required": [
-        "round",
-        "elapsedMs",
-        "sinceProgressMs"
-      ]
-    },
-    "TimeoutInfo": {
-      "type": "object",
-      "properties": {
-        "round": {
-          "type": "number"
-        },
-        "elapsedMs": {
-          "type": "number"
-        }
-      },
-      "required": [
-        "round",
-        "elapsedMs"
-      ]
-    },
-    "HealthWarning": {
-      "type": "object",
-      "properties": {
-        "type": {
-          "type": "string"
-        },
-        "message": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "type",
-        "message"
-      ]
-    },
-    "RuntimeConfig": {
-      "type": "object",
-      "properties": {
-        "task": {
-          "type": "string"
-        },
-        "execute": {
-          "description": "Function signature: AgentExecutor. Omitted from JSON Schema."
-        },
-        "loopId": {
-          "type": "string"
-        },
-        "goalId": {
-          "type": "string"
-        },
-        "maxRounds": {
-          "type": "number"
-        },
-        "roundTimeoutMs": {
-          "type": "number"
-        },
-        "heartbeatIntervalMs": {
-          "type": "number"
-        },
-        "stallGraceMs": {
-          "type": "number"
-        },
-        "maxConsecutiveErrors": {
-          "type": "number"
-        },
-        "interactive": {
-          "type": "boolean"
-        },
-        "healthCheckInterval": {
-          "type": "number"
-        },
-        "planSource": {
-          "type": "string"
-        },
-        "constraintsFromPlan": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "domain": {
-          "type": "string"
-        },
-        "onRoundStart": {
-          "type": "string"
-        },
-        "onRoundComplete": {
-          "type": "string"
-        },
-        "onHeartbeat": {
-          "type": "string"
-        },
-        "onTimeout": {
-          "type": "string"
-        },
-        "onHealthWarning": {
-          "type": "string"
-        },
-        "contextProvider": {
-          "description": "Function signature: ExternalContextProvider. Omitted from JSON Schema."
-        },
-        "terminalSinks": {
-          "type": "array",
-          "items": {
-            "description": "Function signature: LoopTerminalSink. Omitted from JSON Schema."
-          }
-        }
-      },
-      "required": [
-        "task",
-        "execute"
-      ]
     },
     "ExternalContextRequest": {
       "type": "object",
@@ -1251,7 +1373,7 @@
       ],
       "description": "Context supplied to an embedding-owned provider before compilation."
     },
-    "RunResult": {
+    "LoopTerminalEvent": {
       "type": "object",
       "properties": {
         "success": {
@@ -1268,18 +1390,7 @@
           "items": {
             "type": "boolean"
           }
-        }
-      },
-      "required": [
-        "success",
-        "stopReason",
-        "roundsCompleted",
-        "successTrajectory"
-      ]
-    },
-    "LoopTerminalEvent": {
-      "type": "object",
-      "properties": {
+        },
         "loopId": {
           "type": "string"
         },
@@ -1291,10 +1402,13 @@
         }
       },
       "required": [
+        "success",
+        "stopReason",
+        "roundsCompleted",
+        "successTrajectory",
         "loopId",
         "task"
-      ],
-      "description": "Stable, provider-neutral terminal hook payload."
+      ]
     },
     "VerificationFlag": {
       "type": "object",

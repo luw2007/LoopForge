@@ -6,13 +6,13 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { LoopForgeEngine, extractSelfEvaluation, heuristicSelfEvaluation } from "../engine.js";
+import { LoopForgeEngine, extractSelfEvaluation } from "../engine.js";
 import { checkLoopHealth } from "../loop-compiler.js";
 import { getPolicy } from "../policy.js";
-import { Mode, makeLoopCompileRequest } from "../protocol.js";
+import { Mode, makeLoopCompileRequest, makeLoopRoundResult } from "../protocol.js";
 import { ReplayBackend } from "../replay.js";
 import type { VaultBackend, VaultEntry } from "../backends/interface.js";
-import { FileLoopStore, LoopStoreBackend } from "../loop-store.js";
+import { FileLoopStore, LoopStoreBackend, VaultBackendLoopStore } from "../loop-store.js";
 import type { LoopStore } from "../loop-store.js";
 import type {
   LoopForgeRequest, SelfEvaluation, VerificationFlag,
@@ -26,6 +26,7 @@ import {
 } from "../round-transaction.js";
 import type { RoundTransactionSnapshot } from "../round-transaction.js";
 import { RoundDriver } from "../round-driver.js";
+import type { RoundProcessResult } from "../round-coordinator.js";
 import { logEvent } from "../observability.js";
 import { policyMetrics } from "../policy-metrics.js";
 import {
@@ -33,8 +34,6 @@ import {
   VaultSessionStateStore,
 } from "../storage.js";
 import type { SessionStateStore } from "../storage.js";
-import { createCognitiveCheckpoint } from "../interop.js";
-import type { CognitiveCheckpointSink } from "../interop.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -55,6 +54,15 @@ export interface McpSession {
   /** Which enforcement check triggered the last rejection.
    *  Only same-check rejections accumulate toward the max. */
   lastRejectionCheck: string;
+  /** v2.12: Consecutive rounds where the agent used drift_clarification
+   *  to waive R7 rejection. Reset to 0 when a round has no intent_drift.
+   *  Terminates the loop when exceeding policy.drift_clarification_max_streak. */
+  driftClarificationStreak: number;
+  /** v2.13: Files changed in skipped rounds during the last backtrack.
+   *  The next round's verification gate checks that the agent did not
+   *  continue working on stale files without restoring the workspace.
+   *  Cleared after the first successful post-backtrack round. */
+  backtrackSkippedFiles: string[];
   /** Evidence baseline captured immediately before the agent receives a prompt. */
   evidenceBaseline?: ProviderSnapshot[];
   /** Schema-versioned transaction for the prompt currently held by the agent. */
@@ -62,6 +70,8 @@ export interface McpSession {
   /** Persisted prompt prevents resume from compiling the same round twice. */
   currentPrompt?: string | null;
   currentLevel?: string;
+  /** Structured warnings from the most recent compile — preferred over regex parsing. */
+  currentWarnings?: string[];
 }
 
 export interface McpSessionSummary {
@@ -87,15 +97,17 @@ export interface AdvanceResult {
   roundId?: string;
   prompt: string | null;
   stopReason?: string;
+  /** v2.0.1: Human-readable context for why the loop stopped.
+   *  Provides facts the agent can use to decide its next action,
+   *  without LoopForge prescribing a specific behavior. */
+  stopDetail?: string;
   level?: string;
-  /** @deprecated Use roundSuccess instead. Derived: roundSuccess ? 5 : 1 */
-  quality?: number;
   roundSuccess?: boolean;
   warnings?: string[];
   /** v1.13: Enforcement action for this round. accept/reject/terminate.
    *  When "reject", the prompt contains a rejection notice and the agent
    *  must redo the same round. Round counter does NOT increment. */
-  enforcementAction?: "accept" | "reject" | "terminate";
+  enforcementAction?: "accept" | "reject" | "terminate" | "backtrack";
   /** v1.13: When enforcementAction is "reject" or "terminate", the reason
    *  why the round was rejected or the loop was terminated. */
   enforcementReason?: string;
@@ -106,9 +118,8 @@ export interface AdvanceResult {
 function buildLoopRequest(
   session: McpSession,
   lastEval?: SelfEvaluation,
-  _lastQuality?: number, // deprecated — kept for backward compat
   verificationFlags?: VerificationFlag[],
-): Record<string, unknown> {
+): LoopForgeRequest {
   const req: Record<string, unknown> = {
     task: session.task,
     mode: Mode.LOOP_COMPILE,
@@ -122,7 +133,7 @@ function buildLoopRequest(
   };
 
   if (lastEval) {
-    req.last_round_result = {
+    req.last_round_result = makeLoopRoundResult({
       round: session.currentRound - 1,
       success: lastEval.success,
       output_summary: lastEval.output_summary,
@@ -151,23 +162,18 @@ function buildLoopRequest(
       checkpoint_label: lastEval.checkpoint_label ?? "",
       // v1.16: Agent's declared next action
       next_action: lastEval.next_action,
-    };
+      // v2.2: Sub-goal lifecycle
+      completed_subtasks: lastEval.completed_subtasks ?? [],
+      blocked_subtasks: lastEval.blocked_subtasks ?? [],
+      canceled_subtasks: lastEval.canceled_subtasks ?? [],
+      // v2.8: Drift clarification
+      drift_clarification: lastEval.drift_clarification,
+      // v2.9: Model's information needs for the next prompt
+      prompt_requests: lastEval.prompt_requests,
+    });
   }
 
-  return req;
-}
-
-function parseWarnings(prompt: string | null): string[] {
-  if (!prompt) return [];
-  const warnings: string[] = [];
-  const warnSection = prompt.match(/### Warnings\n([\s\S]*?)(?=\n###|\n\*\*|$)/);
-  if (warnSection) {
-    for (const line of warnSection[1].split("\n")) {
-      const m = line.match(/- ⚠️\s*(.+)/);
-      if (m) warnings.push(m[1]);
-    }
-  }
-  return warnings;
+  return req as LoopForgeRequest;
 }
 
 // ── SessionManager ─────────────────────────────────────────────────────────
@@ -182,7 +188,6 @@ export class SessionManager {
   private readonly leaseMs: number;
   private readonly leaseRenewIntervalMs: number;
   private leaseTimer: ReturnType<typeof setInterval> | null = null;
-  private readonly checkpointSinks = new Set<CognitiveCheckpointSink>();
   /** Explicit context provider; never auto-discovered. */
   contextProvider?: ExternalContextProvider;
   private readonly terminalSinks = new Set<LoopTerminalSink>();
@@ -191,13 +196,17 @@ export class SessionManager {
     storeOrBackend?: LoopStore | VaultBackend,
     sessionStore?: SessionStateStore,
   ) {
-    const resolvedBackend = storeOrBackend
-      ? "readSession" in storeOrBackend
-        ? new LoopStoreBackend(storeOrBackend)
-        : storeOrBackend
-      : new LoopStoreBackend(new FileLoopStore(getPolicy().backend.root_dir));
-    this.backend = resolvedBackend;
-    this.sessionStore = sessionStore ?? new VaultSessionStateStore(resolvedBackend);
+    const isLoopStore = (v: LoopStore | VaultBackend): v is LoopStore =>
+      "readSession" in v && typeof (v as LoopStore).readSession === "function";
+    const store: LoopStore = storeOrBackend
+      ? isLoopStore(storeOrBackend)
+        ? storeOrBackend
+        : new VaultBackendLoopStore(storeOrBackend)
+      : new FileLoopStore(getPolicy().backend.root_dir);
+    this.backend = storeOrBackend && !isLoopStore(storeOrBackend)
+      ? storeOrBackend
+      : new LoopStoreBackend(store);
+    this.sessionStore = sessionStore ?? new VaultSessionStateStore(store);
     const mcpPolicy = getPolicy().mcp;
     this.leaseMs = Math.max(1, mcpPolicy.session_lease_ms);
     this.leaseRenewIntervalMs = Math.max(
@@ -216,12 +225,6 @@ export class SessionManager {
   /** Stable process-local owner token used for cross-process session leases. */
   getOwnerId(): string {
     return this.ownerId;
-  }
-
-  /** Subscribe an external checkpointer; sink failures are isolated. */
-  addCheckpointSink(sink: CognitiveCheckpointSink): () => void {
-    this.checkpointSinks.add(sink);
-    return () => this.checkpointSinks.delete(sink);
   }
 
   addTerminalSink(sink: LoopTerminalSink): () => void {
@@ -278,6 +281,7 @@ export class SessionManager {
       round: typeof lineage.current_round === "number" ? lineage.current_round : 0,
       prompt: null,
       stopReason: `session_owned_elsewhere:${loopId}`,
+      stopDetail: `Another process (PID ${entry?.loop_lineage ? (entry.loop_lineage as Record<string,unknown>).lease_owner ?? "unknown" : "unknown"}) holds the lease for loop "${loopId}". Wait for the lease to expire or stop the other process.`,
     };
   }
 
@@ -308,7 +312,7 @@ export class SessionManager {
     const sessionId = randomUUID();
     const loopId = input.loopId ?? randomUUID();
     const engine = new LoopForgeEngine(this.backend);
-    const maxRounds = input.maxRounds ?? getPolicy().runtime.max_rounds;
+    const maxRounds = input.maxRounds ?? getPolicy().engine.max_rounds;
 
     // Populate extra fields for the first round
     const request = buildLoopRequest({
@@ -316,6 +320,8 @@ export class SessionManager {
       maxRounds, successTrajectory: [], status: "running", createdAt: Date.now(),
       consecutiveRejections: 0,
       lastRejectionCheck: "",
+      driftClarificationStreak: 0,
+      backtrackSkippedFiles: [],
       evidenceBaseline: [],
     });
     request.domain = input.domain ?? "";
@@ -346,7 +352,7 @@ export class SessionManager {
     }
 
     const prepared = await new RoundDriver(engine, this.backend).prepare(
-      request as unknown as LoopForgeRequest,
+      request,
       loopId,
       1,
     );
@@ -360,10 +366,13 @@ export class SessionManager {
       // v1.13: Enforcement gate state
       consecutiveRejections: 0,
       lastRejectionCheck: "",
+      driftClarificationStreak: 0,
+      backtrackSkippedFiles: [],
       evidenceBaseline,
       roundSnapshot: prepared?.snapshot ?? prepareRoundTransaction(loopId, 1, evidenceBaseline),
       currentPrompt: initialPrompt,
       currentLevel: initialLevel,
+      currentWarnings: prepared?.warnings ?? [],
     };
     this.sessions.set(sessionId, session);
     policyMetrics.recordStrategy(loopId, initialLevel);
@@ -385,8 +394,7 @@ export class SessionManager {
       prompt: initialPrompt,
       level: initialLevel,
       roundSuccess: false,
-      quality: 0,
-      warnings: parseWarnings(initialPrompt),
+      warnings: prepared?.warnings ?? [],
     };
   }
 
@@ -418,9 +426,10 @@ export class SessionManager {
     const session = this.sessions.get(sessionId);
     if (!session) return false;
     session.status = "stopped";
-    this.save(session); // Persist stopped status to vault so autoResumeAll won't resurrect
+    this.save(session);
     void this.notifyTerminal(session, "cancelled");
     this.sessions.delete(sessionId);
+    this.sessionQueues.delete(sessionId);
     logEvent("session_end", {
       sessionId,
       loopId: session.loopId,
@@ -457,9 +466,8 @@ export class SessionManager {
       roundId: session.roundSnapshot?.roundId,
       prompt: session.currentPrompt,
       level: session.currentLevel ?? "l2",
-      quality: 0,
       roundSuccess: undefined,
-      warnings: parseWarnings(session.currentPrompt),
+      warnings: (session.currentWarnings ?? []),
     };
   }
 
@@ -508,9 +516,31 @@ export class SessionManager {
         roundId: recovered.snapshot.roundId,
         prompt: null,
         stopReason: reason,
+        stopDetail: reason === "completed"
+          ? "Task completed successfully — the agent declared should_continue=false with success=true."
+          : reason === "blocked"
+            ? "Agent cannot proceed under current constraints. The task may need revised constraints or human intervention."
+            : reason === "failed"
+              ? "Agent declared should_continue=false with success=false — the task was not achieved."
+              : `Loop stopped: ${reason}.`,
         roundSuccess: pr.roundSuccess,
-        quality: pr.roundSuccess ? 5 : 1,
       };
+    }
+
+    if (pr.action === "backtrack") {
+      // Backtrack committed but prompt not delivered (crash window).
+      // Reset round counter to the restore target + 1 so the next
+      // resume / unpause compiles from the correct restored state.
+      const restoreTarget = pr.backtrackTarget ?? (session.currentRound - 1);
+      session.currentRound = restoreTarget + 1;
+      session.consecutiveRejections = 0;
+      session.lastRejectionCheck = "";
+      session.driftClarificationStreak = 0;
+      session.lastSelfEval = undefined;
+      session.currentPrompt = null;
+      this.save(session);
+      // Return null — caller (resume/unpause) will recompile normally
+      return null;
     }
 
     if (pr.action !== "continue") return null;
@@ -518,14 +548,13 @@ export class SessionManager {
     const request = buildLoopRequest(
       session,
       pr.newLastSelfEval,
-      pr.roundSuccess ? 5 : 1,
       pr.verificationFlags,
     );
     const prepared = new RoundDriver(
       session.engine,
       this.backend,
     ).prepareSync(
-      request as unknown as LoopForgeRequest,
+      request,
       session.loopId,
       session.currentRound,
     );
@@ -537,6 +566,7 @@ export class SessionManager {
         round: session.currentRound,
         prompt: null,
         stopReason: "stalled",
+        stopDetail: "RoundDriver.prepareSync returned null — prompt compilation failed during crash recovery. The session state may be inconsistent.",
       };
     }
     const prompt = prepared.prompt;
@@ -544,6 +574,7 @@ export class SessionManager {
     session.roundSnapshot = prepared.snapshot;
     session.currentPrompt = prompt;
     session.currentLevel = prepared.level;
+    session.currentWarnings = prepared?.warnings ?? [];
     policyMetrics.recordStrategy(
       session.loopId,
       session.currentLevel,
@@ -557,8 +588,7 @@ export class SessionManager {
       prompt,
       level: session.currentLevel,
       roundSuccess: pr.roundSuccess,
-      quality: pr.roundSuccess ? 5 : 1,
-      warnings: parseWarnings(prompt),
+      warnings: (session.currentWarnings ?? []),
     };
   }
 
@@ -650,7 +680,7 @@ export class SessionManager {
       session.status = "stopped";
       this.save(session);
       void this.notifyTerminal(session, "stalled");
-      return { sessionId: session.sessionId, round: session.currentRound, prompt: null, stopReason: "stalled" };
+      return { sessionId: session.sessionId, round: session.currentRound, prompt: null, stopReason: "stalled", stopDetail: "RoundDriver.prepare returned null during unpause — the compiler could not produce a prompt." };
     }
     const prompt = prepared.prompt;
     const level = prepared.level;
@@ -658,6 +688,7 @@ export class SessionManager {
     session.roundSnapshot = prepared.snapshot;
     session.currentPrompt = prompt;
     session.currentLevel = level;
+    session.currentWarnings = prepared?.warnings ?? [];
     policyMetrics.recordStrategy(session.loopId, level);
     this.save(session);
 
@@ -667,7 +698,6 @@ export class SessionManager {
       roundId: session.roundSnapshot.roundId,
       prompt,
       level,
-      quality: 0,
       roundSuccess: undefined,
       warnings: [],
     };
@@ -695,6 +725,10 @@ export class SessionManager {
           // v1.13: Enforcement gate state
           consecutive_rejections: session.consecutiveRejections,
           last_rejection_check: session.lastRejectionCheck,
+          // v2.12: Clarification streak
+          drift_clarification_streak: session.driftClarificationStreak,
+          // v2.13: Backtrack skipped files for workspace restore check
+          backtrack_skipped_files: session.backtrackSkippedFiles,
           // v1.19: durable round transaction state
           round_snapshot: session.roundSnapshot ?? null,
           last_self_eval: session.lastSelfEval ?? null,
@@ -708,22 +742,6 @@ export class SessionManager {
     this.sessionStore.save(sessionEntry, {
       expectedLeaseOwner: this.ownerId,
     });
-    if (this.checkpointSinks.size > 0) {
-      const checkpoint = createCognitiveCheckpoint(
-        session,
-        sessionEntry.timestamp as string,
-      );
-      for (const sink of this.checkpointSinks) {
-        try {
-          const pending = sink.save(checkpoint);
-          if (pending && typeof pending.then === "function") {
-            void pending.catch(() => undefined);
-          }
-        } catch {
-          // External adapters must not affect session durability.
-        }
-      }
-    }
   }
 
   /** Reconstruct a McpSession from a vault session_state entry.
@@ -745,7 +763,7 @@ export class SessionManager {
       (lineage.success_trajectory as boolean[]) ?? (lineage.quality_trajectory as boolean[]) ?? [];
     const task = (entry.task as string) ?? "";
     const maxRounds =
-      (lineage.max_rounds as number) ?? getPolicy().runtime.max_rounds;
+      (lineage.max_rounds as number) ?? getPolicy().engine.max_rounds;
     const roundSnapshot = parseRoundTransactionSnapshot(lineage.round_snapshot);
     const fallbackEvidence = EvidenceCollector.fromProviderNames(
       getPolicy().evidence.providers,
@@ -773,6 +791,10 @@ export class SessionManager {
       lastRejectionCheck: typeof lineage.last_rejection_check === "string"
         ? lineage.last_rejection_check
         : "",
+      driftClarificationStreak:
+        (lineage.drift_clarification_streak as number) ?? 0,
+      backtrackSkippedFiles:
+        (lineage.backtrack_skipped_files as string[]) ?? [],
       evidenceBaseline: roundSnapshot?.beforeEvidence ?? fallbackEvidence,
       roundSnapshot: roundSnapshot ?? prepareRoundTransaction(
         loopId,
@@ -813,6 +835,7 @@ export class SessionManager {
         round: currentRound,
         prompt: null,
         stopReason: status,
+        stopDetail: `Loop is not running (status: ${status}). It may have already completed or been stopped.`,
       };
     }
 
@@ -830,7 +853,7 @@ export class SessionManager {
       session.engine,
       this.backend,
     ).prepareSync(
-      request as unknown as LoopForgeRequest,
+      request,
       session.loopId,
       session.currentRound,
     );
@@ -843,6 +866,7 @@ export class SessionManager {
     );
     session.currentPrompt = prompt;
     session.currentLevel = prepared?.level ?? "l2";
+    session.currentWarnings = prepared?.warnings ?? [];
     policyMetrics.recordStrategy(
       session.loopId,
       session.currentLevel,
@@ -856,8 +880,7 @@ export class SessionManager {
       prompt,
       level: session.currentLevel,
       roundSuccess: false,
-      quality: 0,
-      warnings: parseWarnings(prompt),
+      warnings: (session.currentWarnings ?? []),
     };
   }
 
@@ -1015,39 +1038,38 @@ export class SessionManager {
     });
   }
 
-  private async advanceUnlocked(
-    sessionId: string,
+  // ── advanceUnlocked pipeline ───────────────────────────────────────────
+  //
+  // The method is split into focused private helpers so each phase of the
+  // round-boundary decision loop is independently readable and testable.
+  //
+  // Pipeline: validate → extract → execute transaction → route disposition
+  //           → advance to next round (continue) or return terminal result.
+
+  /** Extract a SelfEvaluation from agent output.
+   *  Structured param preferred → regex extraction → heuristic fallback.
+   *  Returns null only when both regex and heuristic returned null. */
+  private extractEvaluation(
     output: string,
     preExtractedEval?: SelfEvaluation,
-  ): Promise<AdvanceResult> {
-    const session = this.sessions.get(sessionId);
-    if (!session) return { sessionId, round: 0, prompt: null, stopReason: "session_not_found" };
-    if (session.status !== "running") {
-      return { sessionId, round: session.currentRound, prompt: null, stopReason: session.status };
-    }
-
-    // 1. Extract self-evaluation (structured param preferred → regex → heuristic)
-    let extractionFailed = false;
-    let selfEval: SelfEvaluation | null;
+  ): { selfEval: SelfEvaluation; extractionFailed: boolean } | null {
     if (preExtractedEval) {
-      selfEval = preExtractedEval;
-      extractionFailed = false;
-    } else {
-      const structured = extractSelfEvaluation(output);
-      extractionFailed = structured === null;
-      selfEval = structured ?? heuristicSelfEvaluation(output);
+      return { selfEval: preExtractedEval, extractionFailed: false };
     }
+    const structured = extractSelfEvaluation(output);
+    if (!structured) return null;
+    return { selfEval: structured, extractionFailed: false };
+  }
 
-    // Guard: if both extraction methods returned null, stop
-    if (!selfEval) {
-      session.status = "stalled";
-      this.save(session);
-      void this.notifyTerminal(session, "stalled");
-      logEvent("session_end", { sessionId, loopId: session.loopId, stopReason: "stalled", round: session.currentRound });
-      return { sessionId, round: session.currentRound, prompt: null, stopReason: "stalled", roundSuccess: false, quality: 0 };
-    }
-
-    // 1.5. Unified transaction: before → evaluate → verify → commit/reject.
+  /** Execute the round transaction and apply per-rule rejection tracking.
+   *  MUTATES: session.roundSnapshot, session.consecutiveRejections,
+   *           session.lastRejectionCheck, session.lastSelfEval,
+   *           session.successTrajectory, session.driftClarificationStreak */
+  private async executeRoundTransaction(
+    session: McpSession,
+    selfEval: SelfEvaluation,
+    extractionFailed: boolean,
+  ): Promise<{ pr: RoundProcessResult; verificationFlags: VerificationFlag[]; actualEvidence: ProviderSnapshot[] }> {
     const snapshot = session.roundSnapshot ?? prepareRoundTransaction(
       session.loopId,
       session.currentRound,
@@ -1066,9 +1088,11 @@ export class SessionManager {
       lastSelfEval: session.lastSelfEval,
       consecutiveRejections: session.consecutiveRejections,
       successTrajectory: session.successTrajectory,
+      driftClarificationStreak: session.driftClarificationStreak,
+      backtrackSkippedFiles: session.backtrackSkippedFiles,
     });
     const outcome = completed.outcome;
-    const actualSnapshots = completed.actualEvidence;
+    const actualEvidence = completed.actualEvidence;
     session.roundSnapshot = outcome.snapshot;
     const pr = outcome.result;
     policyMetrics.recordStrategyOutcome(
@@ -1078,9 +1102,12 @@ export class SessionManager {
       outcome.replayed,
     );
 
-    const verificationFlags = pr.verificationFlags;
-    // Track per-rule rejections: only same-check rejections
-    // accumulate. A different rejection reason resets the counter.
+    // v2.12: Clarification streak tracking — independent of rejection tracking.
+    // Reset on rounds without intent_drift; track substantive vs weak clarifications.
+    this.updateClarificationStreak(session, pr);
+
+    // Per-rule rejection tracking: same-check rejections accumulate;
+    // a different rejection reason resets the counter.
     if (pr.action === "reject" && pr.rejectionCheck) {
       session.consecutiveRejections =
         pr.rejectionCheck === session.lastRejectionCheck
@@ -1096,96 +1123,261 @@ export class SessionManager {
       session.successTrajectory.push(pr.roundSuccess);
     }
 
-    // Handle enforcement actions
-    if (pr.action === "reject") {
-      const retryRequest = buildLoopRequest(
-        session,
-        undefined,
-        undefined,
-        verificationFlags,
-      );
-      const preparedRetry = await new RoundDriver(
-        session.engine,
-        this.backend,
-      ).prepareRetry(
-        retryRequest as LoopForgeRequest,
-        session.roundSnapshot,
-        pr.rejectionPrompt ?? "",
-        session.consecutiveRejections,
-      );
-      if (!preparedRetry) {
-        session.status = "stalled";
-        session.currentPrompt = null;
-        this.save(session);
-        return {
-          sessionId,
-          round: session.currentRound,
-          roundId: session.roundSnapshot.roundId,
-          prompt: null,
-          stopReason: "stalled",
-        };
-      }
-      session.roundSnapshot = preparedRetry.snapshot;
-      session.currentPrompt = preparedRetry.prompt;
-      session.currentLevel = preparedRetry.level;
-      this.save(session);
-      return {
-        sessionId,
-        round: session.currentRound,
-        roundId: session.roundSnapshot.roundId,
-        prompt: preparedRetry.prompt,
-        level: preparedRetry.level,
-        enforcementAction: "reject",
-        enforcementReason: pr.enforcementReason,
-      };
+    return { pr, verificationFlags: pr.verificationFlags, actualEvidence };
+  }
+
+  /** v2.12: Update the clarification streak based on the round result.
+   *  - Substantive clarification (anchors present): keep streak — genuine pivot.
+   *  - No intent_drift this round: reset streak to 0.
+   *  - Weak clarification rejected by R7: streak was already consumed by
+   *    enforceIntentDrift to decide reject vs terminate; staleness is handled
+   *    on the enforcement side. We sync the persisted counter for crash recovery.
+   *  MUTATES: session.driftClarificationStreak */
+  private updateClarificationStreak(
+    session: McpSession,
+    pr: RoundProcessResult,
+  ): void {
+    const hasIntentDrift = pr.verificationFlags.some(
+      (f) => f.check === "intent_drift",
+    );
+
+    if (!hasIntentDrift) {
+      // No drift this round — reset streak
+      session.driftClarificationStreak = 0;
+      return;
     }
 
-    // Accepted rounds advance the before-snapshot. Rejected rounds retain the
-    // original baseline so their retry is still a zero-commit transaction.
-    session.evidenceBaseline = actualSnapshots;
+    // v2.12: Clarification accepted with anchors → substantive pivot.
+    // Keep streak as-is (don't increment for genuine explanations).
+    if (pr.clarificationAccepted) {
+      return;
+    }
 
-    if (pr.action === "terminate") {
-      session.status = "stopped";
+    // R7 rejected (weak or no clarification). The enforcement gate
+    // already used the streak to decide reject vs terminate.
+    // Increment the persisted counter so crash recovery sees it.
+    session.driftClarificationStreak += 1;
+  }
+
+  /** Build a rejection result: compile a retry prompt, persist, return.
+   *  MUTATES: session.roundSnapshot, session.currentPrompt, session.currentLevel */
+  private async buildRejectionResult(
+    sessionId: string,
+    session: McpSession,
+    pr: RoundProcessResult,
+    verificationFlags: VerificationFlag[],
+  ): Promise<AdvanceResult> {
+    const retryRequest = buildLoopRequest(session, undefined, verificationFlags);
+    const preparedRetry = await new RoundDriver(
+      session.engine,
+      this.backend,
+    ).prepareRetry(
+      retryRequest,
+      session.roundSnapshot!,
+      pr.rejectionPrompt ?? "",
+      session.consecutiveRejections,
+    );
+    if (!preparedRetry) {
+      session.status = "stalled";
       session.currentPrompt = null;
       this.save(session);
-      void this.notifyTerminal(session, "enforcement_terminated");
-      logEvent("session_end", {
-        sessionId, loopId: session.loopId,
-        stopReason: "enforcement_terminated", round: session.currentRound,
-      });
       return {
         sessionId,
         round: session.currentRound,
-        roundId: session.roundSnapshot.roundId,
+        roundId: session.roundSnapshot?.roundId,
         prompt: null,
-        stopReason: "enforcement_terminated",
-        enforcementAction: "terminate",
-        enforcementReason: pr.enforcementReason,
+        stopReason: "stalled",
+        stopDetail: "RoundDriver.prepareRetry returned null — the retry prompt could not be compiled.",
       };
     }
+    session.roundSnapshot = preparedRetry.snapshot;
+    session.currentPrompt = preparedRetry.prompt;
+    session.currentLevel = preparedRetry.level;
+    session.currentWarnings = preparedRetry.warnings ?? [];
+    this.save(session);
+    return {
+      sessionId,
+      round: session.currentRound,
+      roundId: session.roundSnapshot.roundId,
+      prompt: preparedRetry.prompt,
+      level: preparedRetry.level,
+      enforcementAction: "reject",
+      enforcementReason: pr.enforcementReason,
+    };
+  }
 
-    if (pr.action === "stop") {
-      const reason = pr.stopReason ?? "stalled";
-      session.status = reason === "stalled" ? "stalled" : "stopped";
-      session.currentPrompt = null;
-      this.save(session);
-      void this.notifyTerminal(session, reason);
-      logEvent("session_end", { sessionId, loopId: session.loopId, stopReason: reason, round: session.currentRound });
-      return { sessionId, round: session.currentRound, roundId: session.roundSnapshot.roundId, prompt: null, stopReason: reason, roundSuccess: pr.roundSuccess, quality: pr.roundSuccess ? 5 : 1 };
-    }
+  /** v2.10: Build a backtrack result — roll back to last clean round.
+   *  Resets the round counter to the restore target + 1, merges preserved
+   *  discoveries, compiles from the restored state, and injects the
+   *  backtrack prompt at the top.
+   *  MUTATES: session.currentRound, session.roundSnapshot,
+   *           session.currentPrompt, session.currentLevel,
+   *           session.consecutiveRejections, session.lastSelfEval */
+  private async buildBacktrackResult(
+    sessionId: string,
+    session: McpSession,
+    pr: RoundProcessResult,
+  ): Promise<AdvanceResult> {
+    const restoreTarget = pr.backtrackTarget ?? (session.currentRound - 1);
+    const newRound = restoreTarget + 1;
 
-    const roundSuccess = pr.roundSuccess;
+    logEvent("session_backtrack", {
+      sessionId,
+      loopId: session.loopId,
+      fromRound: session.currentRound,
+      toRound: newRound,
+      triggerRule: pr.backtrackTriggerRule ?? "",
+      skippedDiscoveries: (pr.backtrackSkippedDiscoveries ?? []).length,
+    });
 
-    // Feedback + decision metadata were committed by the transaction layer.
-
-    // Build deprecated quality alias for backward compat
-    const deprecatedQuality = roundSuccess ? 5 : 1;
-
-    // 4. Compile next round after the accepted commit.
-    session.currentRound++;
+    // Reset session to the restored round
+    session.currentRound = newRound;
+    session.consecutiveRejections = 0;
+    session.lastRejectionCheck = "";
+    session.driftClarificationStreak = 0;
+    session.backtrackSkippedFiles = pr.backtrackSkippedFiles ?? [];
+    session.lastSelfEval = undefined; // force L2 recompile from vault state
     session.currentPrompt = null;
 
-    // v1.8: Memory injection for phases 2/3 — tier-aware
+    // Preserve discoveries from skipped rounds as constraints_from_plan
+    // so they survive the compilation and re-enter active constraints.
+    const preservedDiscoveries = pr.backtrackSkippedDiscoveries ?? [];
+
+    // Compile the restored prompt — use a fresh request with the restored round
+    const request: LoopForgeRequest = {
+      task: session.task,
+      mode: Mode.LOOP_COMPILE,
+      feedback: null,
+      skill_name: null,
+      task_id: null,
+      loop_id: session.loopId,
+      round: newRound,
+      max_rounds: session.maxRounds,
+      verification_flags: pr.verificationFlags,
+      constraints_from_plan: preservedDiscoveries,
+    };
+
+    const prepared = await new RoundDriver(
+      session.engine,
+      this.backend,
+    ).prepare(
+      request,
+      session.loopId,
+      newRound,
+    );
+
+    if (!prepared || !prepared.prompt) {
+      session.status = "stalled";
+      session.currentPrompt = null;
+      this.save(session);
+      return {
+        sessionId,
+        round: newRound,
+        prompt: null,
+        stopReason: "stalled",
+        stopDetail: "Backtrack failed: RoundDriver.prepare returned null — could not compile from restore point.",
+        enforcementAction: "backtrack",
+        enforcementReason: pr.enforcementReason,
+      };
+    }
+
+    // Inject backtrack prompt at the top of the compiled prompt
+    const backtrackHeader = pr.backtrackPrompt ?? "";
+    const fullPrompt = backtrackHeader
+      ? backtrackHeader + "\n" + (prepared.prompt ?? "")
+      : prepared.prompt ?? "";
+
+    session.evidenceBaseline = prepared.evidenceBaseline;
+    session.roundSnapshot = prepared.snapshot;
+    session.currentPrompt = fullPrompt;
+    session.currentLevel = prepared.level;
+    session.currentWarnings = prepared?.warnings ?? [];
+    this.save(session);
+
+    return {
+      sessionId,
+      round: newRound,
+      roundId: session.roundSnapshot?.roundId,
+      prompt: fullPrompt,
+      level: prepared.level,
+      enforcementAction: "backtrack",
+      enforcementReason: pr.enforcementReason,
+      warnings: prepared?.warnings ?? [],
+    };
+  }
+
+  /** Build a termination result: persist stopped status, notify sinks.
+   *  MUTATES: session.status, session.currentPrompt */
+  private buildTerminationResult(
+    sessionId: string,
+    session: McpSession,
+    pr: RoundProcessResult,
+  ): AdvanceResult {
+    session.status = "stopped";
+    session.currentPrompt = null;
+    this.save(session);
+    void this.notifyTerminal(session, "enforcement_terminated");
+    logEvent("session_end", {
+      sessionId, loopId: session.loopId,
+      stopReason: "enforcement_terminated", round: session.currentRound,
+    });
+    return {
+      sessionId,
+      round: session.currentRound,
+      roundId: session.roundSnapshot?.roundId,
+      prompt: null,
+      stopReason: "enforcement_terminated",
+      stopDetail: pr.enforcementReason ?? "The enforcement gate terminated the loop.",
+      enforcementAction: "terminate",
+      enforcementReason: pr.enforcementReason,
+    };
+  }
+
+  /** Build a stop result: persist stopped/stalled status, notify sinks.
+   *  MUTATES: session.status, session.currentPrompt */
+  private buildStopResult(
+    sessionId: string,
+    session: McpSession,
+    pr: RoundProcessResult,
+  ): AdvanceResult {
+    const reason = pr.stopReason ?? "stalled";
+    session.status = reason === "stalled" ? "stalled" : "stopped";
+    session.currentPrompt = null;
+    this.save(session);
+    void this.notifyTerminal(session, reason);
+    logEvent("session_end", { sessionId, loopId: session.loopId, stopReason: reason, round: session.currentRound });
+    return {
+      sessionId, round: session.currentRound,
+      roundId: session.roundSnapshot?.roundId,
+      prompt: null, stopReason: reason,
+      stopDetail: pr.stopReason === "circuit_breaker"
+        ? `${pr.roundSuccess ? "No" : "All"} recent rounds failed, triggering the circuit breaker.`
+        : pr.stopReason === "max_rounds"
+          ? "The configured maximum number of rounds has been reached."
+          : `Loop stopped: ${reason}.`,
+      roundSuccess: pr.roundSuccess,
+    };
+  }
+
+  /** Compile the next round's prompt and advance the session.
+   *  Includes the commit fence (pause/delete race guard) and context provider.
+   *  MUTATES: session.currentRound, session.currentPrompt, session.currentLevel,
+   *           session.evidenceBaseline, session.roundSnapshot */
+  private async advanceToNextRound(
+    sessionId: string,
+    session: McpSession,
+    selfEval: SelfEvaluation,
+    pr: RoundProcessResult,
+    verificationFlags: VerificationFlag[],
+    actualEvidence: ProviderSnapshot[],
+  ): Promise<AdvanceResult> {
+    const roundSuccess = pr.roundSuccess;
+    session.currentRound++;
+    session.currentPrompt = null;
+    // v2.13: Clear backtrack skipped files after advancing past the restore round
+    session.backtrackSkippedFiles = [];
+
+    // v1.8: Memory injection — tier-aware external context.
     let externalCtx = "";
     if (this.contextProvider) {
       try {
@@ -1204,22 +1396,20 @@ export class SessionManager {
       }
     }
 
-    // pause()/delete() are intentionally synchronous for API compatibility.
-    // They may run while the memory provider above is awaited.  Treat the
-    // session map + status as a commit fence so an in-flight advance cannot
-    // compile/save another round after a terminal lifecycle transition.
+    // Commit fence: pause()/delete() may have run while the context provider
+    // was awaited. Do not compile if the session is no longer running.
     if (this.sessions.get(sessionId) !== session || session.status !== "running") {
       return {
         sessionId,
         round: session.currentRound,
         prompt: null,
         stopReason: session.status,
+        stopDetail: `Session is no longer running (status: ${session.status}). It was paused or deleted while the context provider was running.`,
         roundSuccess,
-        quality: deprecatedQuality,
       };
     }
 
-    const request = buildLoopRequest(session, selfEval, deprecatedQuality, verificationFlags);
+    const request = buildLoopRequest(session, selfEval, verificationFlags);
     if (externalCtx) {
       request.external_context = externalCtx;
     }
@@ -1227,13 +1417,13 @@ export class SessionManager {
       session.engine,
       this.backend,
     ).prepare(
-      request as unknown as LoopForgeRequest,
+      request,
       session.loopId,
       session.currentRound,
     );
     const nextPrompt = prepared?.prompt ?? null;
     const nextLevel = prepared?.level ?? "l2";
-    const nextBaseline = prepared?.evidenceBaseline ?? actualSnapshots;
+    const nextBaseline = prepared?.evidenceBaseline ?? actualEvidence;
     session.evidenceBaseline = nextBaseline;
     session.roundSnapshot = prepared?.snapshot ?? prepareRoundTransaction(
       session.loopId,
@@ -1242,8 +1432,8 @@ export class SessionManager {
     );
     session.currentPrompt = nextPrompt;
     session.currentLevel = nextLevel;
+    session.currentWarnings = prepared?.warnings ?? [];
     policyMetrics.recordStrategy(session.loopId, nextLevel);
-
     this.save(session);
 
     return {
@@ -1253,9 +1443,61 @@ export class SessionManager {
       prompt: nextPrompt,
       level: nextLevel,
       roundSuccess,
-      quality: deprecatedQuality,
-      warnings: parseWarnings(nextPrompt),
+      warnings: prepared?.warnings ?? [],
     };
+  }
+
+  private async advanceUnlocked(
+    sessionId: string,
+    output: string,
+    preExtractedEval?: SelfEvaluation,
+  ): Promise<AdvanceResult> {
+    // ── 1. Validate session ──────────────────────────────────────────────
+    const session = this.sessions.get(sessionId);
+    if (!session) return { sessionId, round: 0, prompt: null, stopReason: "session_not_found", stopDetail: "No session exists with this ID. It may have expired, been deleted, or never existed." };
+    if (session.status !== "running") {
+      return { sessionId, round: session.currentRound, prompt: null, stopReason: session.status, stopDetail: `Session is ${session.status}. Use loopforge_resume to restart a paused session, or loopforge_start for a new task.` };
+    }
+
+    // ── 2. Extract self-evaluation ───────────────────────────────────────
+    const extracted = this.extractEvaluation(output, preExtractedEval);
+    if (!extracted) {
+      session.status = "stalled";
+      this.save(session);
+      void this.notifyTerminal(session, "stalled");
+      logEvent("session_end", { sessionId, loopId: session.loopId, stopReason: "stalled", round: session.currentRound });
+      return { sessionId, round: session.currentRound, prompt: null, stopReason: "stalled", stopDetail: "Self-evaluation could not be extracted from agent output. Both structured regex and heuristic fallback returned null.", roundSuccess: false };
+    }
+    const { selfEval, extractionFailed } = extracted;
+
+    // ── 3. Execute round transaction ─────────────────────────────────────
+    const tx = await this.executeRoundTransaction(session, selfEval, extractionFailed);
+
+    // ── 4. Route disposition ─────────────────────────────────────────────
+    if (tx.pr.action === "reject") {
+      return this.buildRejectionResult(sessionId, session, tx.pr, tx.verificationFlags);
+    }
+
+    // ── v2.10: Backtrack — roll back to last clean round ──────────────────
+    if (tx.pr.action === "backtrack") {
+      return this.buildBacktrackResult(sessionId, session, tx.pr);
+    }
+
+    // Accepted rounds advance the before-snapshot baseline. Rejected rounds
+    // retain the original baseline so their retry remains zero-commit.
+    session.evidenceBaseline = tx.actualEvidence;
+
+    if (tx.pr.action === "terminate") {
+      return this.buildTerminationResult(sessionId, session, tx.pr);
+    }
+    if (tx.pr.action === "stop") {
+      return this.buildStopResult(sessionId, session, tx.pr);
+    }
+
+    // ── 5. Continue — compile next round ─────────────────────────────────
+    return this.advanceToNextRound(
+      sessionId, session, selfEval, tx.pr, tx.verificationFlags, tx.actualEvidence,
+    );
   }
 
   /** Write back loop knowledge to long-term memory.

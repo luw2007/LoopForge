@@ -7,7 +7,8 @@ import {
   type SelfEvaluation,
 } from "../protocol.js";
 import type { VaultEntry } from "../backends/interface.js";
-import { verifySelfEvaluation } from "../verification-gate.js";
+import { verifySelfEvaluation, parseTestOutput } from "../verification-gate.js";
+import type { ProviderSnapshot } from "../evidence-provider.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helpers
@@ -477,71 +478,403 @@ describe("verification-gate — verdict aggregation", () => {
     assert.equal(result.flags.length, 0);
   });
 
-  // ── v1.16: files_integrity check ──────────────────────────────────────────
+});
 
-  it("checkFilesIntegrity: flags mismatch when agent reports different files than git", () => {
+// ═══════════════════════════════════════════════════════════════════════════
+// parseTestOutput — unit tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("parseTestOutput", () => {
+  it("parses Jest verbose: Tests: 1 failed, 8 passed, 9 total", () => {
+    const result = parseTestOutput("Tests: 1 failed, 8 passed, 9 total");
+    assert.deepEqual(result, { passed: 8, failed: 1, skipped: 0, total: 9 });
+  });
+
+  it("parses Jest compact: Tests: 8 passed, 9 total", () => {
+    const result = parseTestOutput("Tests: 8 passed, 9 total");
+    assert.deepEqual(result, { passed: 8, failed: 1, skipped: 0, total: 9 });
+  });
+
+  it("parses Mocha: 8 passing, 2 failing", () => {
+    const result = parseTestOutput("  8 passing (2s)\n  2 failing\n");
+    assert.deepEqual(result, { passed: 8, failed: 2, skipped: 0, total: 10 });
+  });
+
+  it("parses Mocha: 15 passing only (no failures)", () => {
+    const result = parseTestOutput("  15 passing (3s)\n");
+    assert.deepEqual(result, { passed: 15, failed: 0, skipped: 0, total: 15 });
+  });
+
+  it("parses Go test: --- PASS / --- FAIL lines", () => {
+    const stdout = "--- PASS: TestFoo (0.01s)\n--- PASS: TestBar (0.02s)\n--- FAIL: TestBaz (0.01s)\n";
+    const result = parseTestOutput(stdout);
+    assert.deepEqual(result, { passed: 2, failed: 1, skipped: 0, total: 3 });
+  });
+
+  it("parses Go test: all pass", () => {
+    const stdout = "--- PASS: TestA\n--- PASS: TestB\n--- PASS: TestC\nok  example.com/pkg  0.123s\n";
+    const result = parseTestOutput(stdout);
+    assert.deepEqual(result, { passed: 3, failed: 0, skipped: 0, total: 3 });
+  });
+
+  it("parses pytest: 8 passed, 1 failed", () => {
+    const result = parseTestOutput("======= 8 passed, 1 failed in 2.34s =======");
+    assert.deepEqual(result, { passed: 8, failed: 1, skipped: 0, total: 9 });
+  });
+
+  it("parses pytest: 42 passed", () => {
+    const result = parseTestOutput("============ test session starts ============\n42 passed in 5.12s");
+    assert.deepEqual(result, { passed: 42, failed: 0, skipped: 0, total: 42 });
+  });
+
+  it("parses PHPUnit: OK (8 tests, 16 assertions)", () => {
+    const result = parseTestOutput("OK (8 tests, 16 assertions)");
+    assert.deepEqual(result, { passed: 8, failed: 0, skipped: 0, total: 8 });
+  });
+
+  it("returns null for unrecognized output", () => {
+    const result = parseTestOutput("Build completed successfully.");
+    assert.equal(result, null);
+  });
+
+  it("returns null for empty string", () => {
+    const result = parseTestOutput("");
+    assert.equal(result, null);
+  });
+
+  it("scans only last 2000 characters for summary", () => {
+    const prefix = "x".repeat(3000);
+    const result = parseTestOutput(prefix + "\nTests: 3 passed, 3 total");
+    assert.deepEqual(result, { passed: 3, failed: 0, skipped: 0, total: 3 });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// checkCommandEvidenceIntegrity — via verifySelfEvaluation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Build a minimal command evidence snapshot for testing. */
+function cmdSnapshot(overrides: Record<string, unknown> = {}): ProviderSnapshot {
+  return {
+    provider: "command:test",
+    timestamp: Date.now(),
+    files: [],
+    data: {
+      kind: "command",
+      commandName: "test",
+      required: false,
+      phase: "after",
+      status: "passed",
+      exitCode: 0,
+      signal: null,
+      durationMs: 100,
+      stdout: "",
+      stderr: "",
+      truncated: false,
+      ...overrides,
+    },
+  };
+}
+
+describe("verification-gate — command evidence integrity", () => {
+  it("no flag when test counts match exactly", () => {
     const curr = se({
       execution_evidence: makeExecutionEvidence({
-        files_changed: ["src/foo.ts", "src/bar.ts"],
-        progress_estimate: 0.5,
+        files_changed: [],
+        test_results: { passed: 8, failed: 1, skipped: 0 },
       }),
     });
-    // Git only detected src/foo.ts — agent falsely reported src/bar.ts
-    const result = verifySelfEvaluation(curr, 2, [], null, ["src/foo.ts"]);
-    assert.ok(result.flags.length >= 1);
-    const flag = result.flags.find(f => f.check === "files_integrity");
-    assert.ok(flag, "should have files_integrity flag");
+    const snap = cmdSnapshot({ stdout: "Tests: 1 failed, 8 passed, 9 total" });
+    const result = verifySelfEvaluation(curr, 2, [], null, [snap]);
+    const flag = result.flags.find(f => f.check === "command_evidence_mismatch");
+    assert.equal(flag, undefined, "should not flag when counts match");
+  });
+
+  it("warn when passed counts differ", () => {
+    const curr = se({
+      execution_evidence: makeExecutionEvidence({
+        files_changed: [],
+        test_results: { passed: 10, failed: 1, skipped: 0 },
+      }),
+    });
+    const snap = cmdSnapshot({ stdout: "Tests: 1 failed, 8 passed, 9 total" });
+    const result = verifySelfEvaluation(curr, 2, [], null, [snap]);
+    const flag = result.flags.find(f => f.check === "command_evidence_mismatch");
+    assert.ok(flag, "should flag mismatch");
     assert.equal(flag!.severity, "warn");
-    assert.ok(flag!.detail.includes("src/bar.ts"), "should mention ghost file");
+    assert.ok(flag!.detail.includes("reported 10"), "should mention reported count");
+    assert.ok(flag!.detail.includes("shows 8"), "should mention command count");
   });
 
-  it("checkFilesIntegrity: flags when agent says no files but git shows changes", () => {
+  it("error when agent reports 0 failed but command shows failures", () => {
     const curr = se({
+      success: true,
       execution_evidence: makeExecutionEvidence({
         files_changed: [],
-        progress_estimate: 0.5,
+        test_results: { passed: 8, failed: 0, skipped: 0 },
       }),
     });
-    const result = verifySelfEvaluation(curr, 2, [], null, ["src/real.ts"]);
-    assert.ok(result.flags.length >= 1);
-    const flag = result.flags.find(f => f.check === "files_integrity");
-    assert.ok(flag, "should flag when agent reports empty but git shows files");
+    const snap = cmdSnapshot({ stdout: "Tests: 2 failed, 8 passed, 10 total" });
+    const result = verifySelfEvaluation(curr, 2, [], null, [snap]);
+    const flag = result.flags.find(f => f.check === "command_evidence_mismatch");
+    assert.ok(flag, "should flag hidden failures");
+    assert.equal(flag!.severity, "error");
   });
 
-  it("checkFilesIntegrity: no flag when both are empty", () => {
-    const curr = se({
-      execution_evidence: makeExecutionEvidence({
-        files_changed: [],
-        progress_estimate: 0.5,
-      }),
-    });
-    const result = verifySelfEvaluation(curr, 2, [], null, []);
-    const flag = result.flags.find(f => f.check === "files_integrity");
-    assert.equal(flag, undefined, "should not flag when both empty");
-  });
-
-  it("checkFilesIntegrity: no flag when git is unavailable (null)", () => {
+  it("no flag when agent has no test_results", () => {
     const curr = se({
       execution_evidence: makeExecutionEvidence({
         files_changed: ["src/foo.ts"],
-        progress_estimate: 0.5,
+        test_results: null,
       }),
     });
-    // null = git unavailable, should skip check entirely
-    const result = verifySelfEvaluation(curr, 2, [], null, null);
-    const flag = result.flags.find(f => f.check === "files_integrity");
-    assert.equal(flag, undefined, "should not flag when git unavailable");
+    const snap = cmdSnapshot({ stdout: "Tests: 1 failed, 8 passed, 9 total" });
+    const result = verifySelfEvaluation(curr, 2, [], null, [snap]);
+    const flag = result.flags.find(f => f.check === "command_evidence_mismatch");
+    assert.equal(flag, undefined, "should skip when no test_results reported");
   });
 
-  it("checkFilesIntegrity: no flag when reported matches git exactly", () => {
+  it("no flag when command output is truncated", () => {
     const curr = se({
       execution_evidence: makeExecutionEvidence({
-        files_changed: ["src/a.ts", "src/b.ts"],
-        progress_estimate: 0.5,
+        test_results: { passed: 8, failed: 1, skipped: 0 },
       }),
     });
-    const result = verifySelfEvaluation(curr, 2, [], null, ["src/a.ts", "src/b.ts"]);
-    const flag = result.flags.find(f => f.check === "files_integrity");
-    assert.equal(flag, undefined, "should not flag when files match");
+    const snap = cmdSnapshot({
+      stdout: "Tests: 1 failed, 8 passed, 9 total",
+      truncated: true,
+    });
+    const result = verifySelfEvaluation(curr, 2, [], null, [snap]);
+    const flag = result.flags.find(f => f.check === "command_evidence_mismatch");
+    assert.equal(flag, undefined, "should skip when output is truncated");
+  });
+
+  it("no flag when command status is not passed", () => {
+    const curr = se({
+      execution_evidence: makeExecutionEvidence({
+        test_results: { passed: 8, failed: 1, skipped: 0 },
+      }),
+    });
+    const snap = cmdSnapshot({
+      stdout: "Tests: 1 failed, 8 passed, 9 total",
+      status: "failed",
+      exitCode: 1,
+    });
+    const result = verifySelfEvaluation(curr, 2, [], null, [snap]);
+    const flag = result.flags.find(f => f.check === "command_evidence_mismatch");
+    assert.equal(flag, undefined, "should skip non-passed commands");
+  });
+
+  it("no flag for non-command evidence providers", () => {
+    const curr = se({
+      execution_evidence: makeExecutionEvidence({
+        test_results: { passed: 8, failed: 1, skipped: 0 },
+      }),
+    });
+    // A non-command provider (e.g. a hypothetical coverage provider)
+    const snap: ProviderSnapshot = {
+      provider: "coverage",
+      timestamp: Date.now(),
+      files: [],
+      data: { kind: "coverage", coverage: 0.8 },
+    };
+    const result = verifySelfEvaluation(curr, 2, [], null, [snap]);
+    const flag = result.flags.find(f => f.check === "command_evidence_mismatch");
+    assert.equal(flag, undefined, "should skip non-command providers");
+  });
+
+  it("no flag when command output is unparseable", () => {
+    const curr = se({
+      execution_evidence: makeExecutionEvidence({
+        test_results: { passed: 8, failed: 1, skipped: 0 },
+      }),
+    });
+    const snap = cmdSnapshot({ stdout: "All checks passed! ✨" });
+    const result = verifySelfEvaluation(curr, 2, [], null, [snap]);
+    const flag = result.flags.find(f => f.check === "command_evidence_mismatch");
+    assert.equal(flag, undefined, "should skip unparseable output");
+  });
+
+  it("no flag with empty evidence snapshots", () => {
+    const curr = se({
+      execution_evidence: makeExecutionEvidence({
+        test_results: { passed: 8, failed: 1, skipped: 0 },
+      }),
+    });
+    const result = verifySelfEvaluation(curr, 2, [], null, []);
+    const flag = result.flags.find(f => f.check === "command_evidence_mismatch");
+    assert.equal(flag, undefined, "should skip when no snapshots");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v2.1: Intent-action drift detection
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("verification-gate — intent-action drift", () => {
+  it("no flag when next_action and output_summary are semantically similar", () => {
+    const prev = se({ next_action: "Refactor the authentication module" });
+    const curr = se({ output_summary: "Refactored the authentication module — extracted middleware, updated tests" });
+    const result = verifySelfEvaluation(curr, 3, [], prev);
+    const flag = result.flags.find(f => f.check === "intent_drift");
+    assert.equal(flag, undefined, "should not flag when intent matches action");
+  });
+
+  it("warn flag when next_action is completely unrelated to output_summary", () => {
+    const prev = se({ next_action: "Refactor the authentication module" });
+    const curr = se({ output_summary: "Fixed CSS padding on login button and adjusted margins" });
+    const result = verifySelfEvaluation(curr, 3, [], prev);
+    const flag = result.flags.find(f => f.check === "intent_drift");
+    assert.ok(flag, "should flag intent-action drift");
+    assert.equal(flag.severity, "warn");
+    assert.ok(flag.detail.includes("intent"), "detail should mention declared intent");
+    assert.ok(flag.detail.includes("similarity"), "detail should include similarity score");
+  });
+
+  it("no flag when prevSelfEval is null (round 1 has no prior intent)", () => {
+    const curr = se({ output_summary: "Fixed CSS padding" });
+    const result = verifySelfEvaluation(curr, 1, [], null);
+    const flag = result.flags.find(f => f.check === "intent_drift");
+    assert.equal(flag, undefined, "should not flag without previous self-eval");
+  });
+
+  it("no flag when next_action is empty string", () => {
+    const prev = se({ next_action: "" });
+    const curr = se({ output_summary: "Fixed CSS padding" });
+    const result = verifySelfEvaluation(curr, 3, [], prev);
+    const flag = result.flags.find(f => f.check === "intent_drift");
+    assert.equal(flag, undefined, "should not flag when intent is empty");
+  });
+
+  it("no flag when output_summary is empty", () => {
+    const prev = se({ next_action: "Refactor auth module" });
+    const curr = se({ output_summary: "" });
+    const result = verifySelfEvaluation(curr, 3, [], prev);
+    const flag = result.flags.find(f => f.check === "intent_drift");
+    assert.equal(flag, undefined, "should not flag when summary is empty");
+  });
+
+  it("no flag when next_action is undefined", () => {
+    const prev = se({ next_action: undefined });
+    const curr = se({ output_summary: "Fixed CSS padding" });
+    const result = verifySelfEvaluation(curr, 3, [], prev);
+    const flag = result.flags.find(f => f.check === "intent_drift");
+    assert.equal(flag, undefined, "should not flag when intent is undefined");
+  });
+
+  it("verdict is suspect when intent drift is the only flag", () => {
+    const prev = se({ next_action: "Refactor auth" });
+    const curr = se({ output_summary: "Fixed CSS padding" });
+    const result = verifySelfEvaluation(curr, 3, [], prev);
+    assert.equal(result.verdict, "suspect", "intent_drift is a warn-level flag");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v2.13: Backtrack workspace restore check
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("verification-gate — backtrack workspace restore", () => {
+  function se(overrides: Partial<SelfEvaluation> = {}): SelfEvaluation {
+    return makeSelfEvaluation({
+      success: false,
+      output_summary: "Worked on feature",
+      should_continue: true,
+      execution_evidence: makeExecutionEvidence({
+        files_changed: ["src/new-feature.ts"],
+        progress_estimate: 0.5,
+      }),
+      ...overrides,
+    });
+  }
+
+  it("no flag when backtrackSkippedFiles is empty", () => {
+    const result = verifySelfEvaluation(
+      se({ execution_evidence: makeExecutionEvidence({
+        files_changed: ["src/auth.ts"],
+      })}),
+      3, [], null, [], [],
+    );
+    const flag = result.flags.find(
+      (f) => f.check === "backtrack_workspace_not_restored",
+    );
+    assert.equal(flag, undefined,
+      "should not flag when no backtrack skipped files");
+  });
+
+  it("no flag when files_changed has no overlap with skipped files", () => {
+    const result = verifySelfEvaluation(
+      se({ execution_evidence: makeExecutionEvidence({
+        files_changed: ["src/auth.ts"],
+      })}),
+      3, [], null, [],
+      ["src/old-feature.ts", "tests/old.test.ts"],
+    );
+    const flag = result.flags.find(
+      (f) => f.check === "backtrack_workspace_not_restored",
+    );
+    assert.equal(flag, undefined,
+      "should not flag when agent works on different files");
+  });
+
+  it("warns when files_changed has minor overlap with skipped files", () => {
+    const result = verifySelfEvaluation(
+      se({ execution_evidence: makeExecutionEvidence({
+        files_changed: ["src/auth.ts", "src/new.ts"],
+      })}),
+      3, [], null, [],
+      ["src/auth.ts", "lib/old.go"],
+    );
+    const flag = result.flags.find(
+      (f) => f.check === "backtrack_workspace_not_restored",
+    );
+    assert.ok(flag, "should flag minor overlap");
+    assert.equal(flag.severity, "warn",
+      "minor overlap (1-2 files) should be a warning");
+  });
+
+  it("errors when files_changed has significant overlap (>= 3 files)", () => {
+    const result = verifySelfEvaluation(
+      se({ execution_evidence: makeExecutionEvidence({
+        files_changed: ["src/a.ts", "src/b.ts", "src/c.ts"],
+      })}),
+      3, [], null, [],
+      ["src/a.ts", "src/b.ts", "src/c.ts", "lib/x.go"],
+    );
+    const flag = result.flags.find(
+      (f) => f.check === "backtrack_workspace_not_restored",
+    );
+    assert.ok(flag, "should flag significant overlap");
+    assert.equal(flag.severity, "error",
+      ">= 3 overlapping files should be an error");
+  });
+
+  it("errors when ALL files_changed overlap with skipped files", () => {
+    const result = verifySelfEvaluation(
+      se({ execution_evidence: makeExecutionEvidence({
+        files_changed: ["src/a.ts", "src/b.ts"],
+      })}),
+      3, [], null, [],
+      ["src/a.ts", "src/b.ts"],
+    );
+    const flag = result.flags.find(
+      (f) => f.check === "backtrack_workspace_not_restored",
+    );
+    assert.ok(flag, "should flag when all files overlap");
+    assert.equal(flag.severity, "error",
+      "100% overlap should be an error");
+  });
+
+  it("no flag when execution_evidence is absent", () => {
+    const result = verifySelfEvaluation(
+      se({ execution_evidence: undefined }),
+      3, [], null, [],
+      ["src/auth.ts"],
+    );
+    const flag = result.flags.find(
+      (f) => f.check === "backtrack_workspace_not_restored",
+    );
+    assert.equal(flag, undefined,
+      "should not flag when no execution evidence");
   });
 });

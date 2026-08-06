@@ -8,10 +8,7 @@
 
 import type { VaultBackend, VaultEntry } from "./backends/interface.js";
 import { LoopForgeEngine } from "./engine.js";
-import {
-  diffSnapshotCollections,
-  extractFilesFromSnapshots,
-} from "./evidence-provider.js";
+import { diffSnapshotCollections } from "./evidence-provider.js";
 import type { ProviderSnapshot } from "./evidence-provider.js";
 import type { SelfEvaluation } from "./protocol.js";
 import type { PromptArtifact } from "./protocol.js";
@@ -19,7 +16,8 @@ import {
   RoundCoordinator,
   type RoundProcessResult,
 } from "./round-coordinator.js";
-import { logEvent, startSpan } from "./observability.js";
+import { logEvent } from "./observability.js";
+import { isRecord } from "./token-utils.js";
 import { policyMetrics } from "./policy-metrics.js";
 import { VaultRoundCommitStore } from "./storage.js";
 import type { RoundCommitStore } from "./storage.js";
@@ -61,6 +59,10 @@ export interface RoundTransactionInput {
   lastSelfEval?: SelfEvaluation;
   consecutiveRejections: number;
   successTrajectory: boolean[];
+  /** v2.12: Current clarification streak for R7 escalation. */
+  driftClarificationStreak?: number;
+  /** v2.13: Files from skipped backtrack rounds for restore check. */
+  backtrackSkippedFiles?: string[];
   actualEvidence: ProviderSnapshot[];
 }
 
@@ -132,13 +134,10 @@ export function prepareRejectedAttempt(
   };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 
 function isProcessResult(value: unknown): value is RoundProcessResult {
   if (!isRecord(value)) return false;
-  return ["continue", "stop", "reject", "terminate"].includes(
+  return ["continue", "stop", "reject", "terminate", "backtrack"].includes(
     String(value.action),
   ) && Array.isArray(value.verificationFlags);
 }
@@ -226,23 +225,12 @@ export class RoundTransactionCoordinator {
 
   process(input: RoundTransactionInput): RoundTransactionOutcome {
     const { snapshot } = input;
-    const span = startSpan("round.transaction", {
-      loopId: snapshot.loopId,
-      round: snapshot.round,
-      roundId: snapshot.roundId,
-      attempt: snapshot.attempt,
-    });
     const finish = (outcome: RoundTransactionOutcome): RoundTransactionOutcome => {
       policyMetrics.recordRound(
         snapshot.loopId,
         outcome.result,
         outcome.replayed,
       );
-      span.end("ok", {
-        action: outcome.result.action,
-        replayed: outcome.replayed,
-        phase: outcome.snapshot.phase,
-      });
       return outcome;
     };
     try {
@@ -280,10 +268,10 @@ export class RoundTransactionCoordinator {
       extractionSucceeded: input.extractionSucceeded,
       lastSelfEval: input.lastSelfEval,
       consecutiveRejections: input.consecutiveRejections,
-      runtimeFilesChanged: extractFilesFromSnapshots(roundEvidence),
       evidenceSnapshots: roundEvidence,
       successTrajectory: input.successTrajectory,
-    });
+      backtrackSkippedFiles: input.backtrackSkippedFiles,
+    }, input.driftClarificationStreak ?? 0);
 
     const evaluated: RoundTransactionSnapshot = {
       ...snapshot,
@@ -338,28 +326,20 @@ export class RoundTransactionCoordinator {
     });
     return finish({ snapshot: committedSnapshot, result, replayed: false });
     } catch (error) {
-      span.end("error", { error: String(error) });
-      throw error;
+            throw error;
     }
   }
 
   /** Recover an already committed decision without evaluating or writing. */
   recover(snapshot: RoundTransactionSnapshot): RoundTransactionOutcome | null {
-    const span = startSpan("round.transaction.recover", {
-      loopId: snapshot.loopId,
-      round: snapshot.round,
-      roundId: snapshot.roundId,
-    });
     try {
       const outcome = this.readCommitted(snapshot);
       if (outcome) {
         policyMetrics.recordRound(snapshot.loopId, outcome.result, true);
       }
-      span.end("ok", { recovered: outcome !== null });
-      return outcome;
+            return outcome;
     } catch (error) {
-      span.end("error", { error: String(error) });
-      throw error;
+            throw error;
     }
   }
 

@@ -11,7 +11,6 @@ import type { SelfEvaluation, ExternalContextProvider, LoopTerminalSink } from "
 import type { ProviderSnapshot } from "../evidence-provider.js";
 import type { RoundTransactionSnapshot } from "../round-transaction.js";
 import type { SessionStateStore } from "../storage.js";
-import type { CognitiveCheckpointSink } from "../interop.js";
 export interface McpSession {
     sessionId: string;
     loopId: string;
@@ -28,6 +27,15 @@ export interface McpSession {
     /** Which enforcement check triggered the last rejection.
      *  Only same-check rejections accumulate toward the max. */
     lastRejectionCheck: string;
+    /** v2.12: Consecutive rounds where the agent used drift_clarification
+     *  to waive R7 rejection. Reset to 0 when a round has no intent_drift.
+     *  Terminates the loop when exceeding policy.drift_clarification_max_streak. */
+    driftClarificationStreak: number;
+    /** v2.13: Files changed in skipped rounds during the last backtrack.
+     *  The next round's verification gate checks that the agent did not
+     *  continue working on stale files without restoring the workspace.
+     *  Cleared after the first successful post-backtrack round. */
+    backtrackSkippedFiles: string[];
     /** Evidence baseline captured immediately before the agent receives a prompt. */
     evidenceBaseline?: ProviderSnapshot[];
     /** Schema-versioned transaction for the prompt currently held by the agent. */
@@ -35,6 +43,8 @@ export interface McpSession {
     /** Persisted prompt prevents resume from compiling the same round twice. */
     currentPrompt?: string | null;
     currentLevel?: string;
+    /** Structured warnings from the most recent compile — preferred over regex parsing. */
+    currentWarnings?: string[];
 }
 export interface McpSessionSummary {
     sessionId: string;
@@ -57,15 +67,17 @@ export interface AdvanceResult {
     roundId?: string;
     prompt: string | null;
     stopReason?: string;
+    /** v2.0.1: Human-readable context for why the loop stopped.
+     *  Provides facts the agent can use to decide its next action,
+     *  without LoopForge prescribing a specific behavior. */
+    stopDetail?: string;
     level?: string;
-    /** @deprecated Use roundSuccess instead. Derived: roundSuccess ? 5 : 1 */
-    quality?: number;
     roundSuccess?: boolean;
     warnings?: string[];
     /** v1.13: Enforcement action for this round. accept/reject/terminate.
      *  When "reject", the prompt contains a rejection notice and the agent
      *  must redo the same round. Round counter does NOT increment. */
-    enforcementAction?: "accept" | "reject" | "terminate";
+    enforcementAction?: "accept" | "reject" | "terminate" | "backtrack";
     /** v1.13: When enforcementAction is "reject" or "terminate", the reason
      *  why the round was rejected or the loop was terminated. */
     enforcementReason?: string;
@@ -80,15 +92,12 @@ export declare class SessionManager {
     private readonly leaseMs;
     private readonly leaseRenewIntervalMs;
     private leaseTimer;
-    private readonly checkpointSinks;
     /** Explicit context provider; never auto-discovered. */
     contextProvider?: ExternalContextProvider;
     private readonly terminalSinks;
     constructor(storeOrBackend?: LoopStore | VaultBackend, sessionStore?: SessionStateStore);
     /** Stable process-local owner token used for cross-process session leases. */
     getOwnerId(): string;
-    /** Subscribe an external checkpointer; sink failures are isolated. */
-    addCheckpointSink(sink: CognitiveCheckpointSink): () => void;
     addTerminalSink(sink: LoopTerminalSink): () => void;
     /** Release owned sessions and stop lease maintenance. */
     close(): void;
@@ -144,6 +153,45 @@ export declare class SessionManager {
      *    When provided (MCP path with evaluation parameter), skips regex extraction.
      *    When undefined (runtime/CLI path), falls back to regex extraction from output. */
     advance(sessionId: string, output: string, preExtractedEval?: SelfEvaluation): Promise<AdvanceResult>;
+    /** Extract a SelfEvaluation from agent output.
+     *  Structured param preferred → regex extraction → heuristic fallback.
+     *  Returns null only when both regex and heuristic returned null. */
+    private extractEvaluation;
+    /** Execute the round transaction and apply per-rule rejection tracking.
+     *  MUTATES: session.roundSnapshot, session.consecutiveRejections,
+     *           session.lastRejectionCheck, session.lastSelfEval,
+     *           session.successTrajectory, session.driftClarificationStreak */
+    private executeRoundTransaction;
+    /** v2.12: Update the clarification streak based on the round result.
+     *  - Substantive clarification (anchors present): keep streak — genuine pivot.
+     *  - No intent_drift this round: reset streak to 0.
+     *  - Weak clarification rejected by R7: streak was already consumed by
+     *    enforceIntentDrift to decide reject vs terminate; staleness is handled
+     *    on the enforcement side. We sync the persisted counter for crash recovery.
+     *  MUTATES: session.driftClarificationStreak */
+    private updateClarificationStreak;
+    /** Build a rejection result: compile a retry prompt, persist, return.
+     *  MUTATES: session.roundSnapshot, session.currentPrompt, session.currentLevel */
+    private buildRejectionResult;
+    /** v2.10: Build a backtrack result — roll back to last clean round.
+     *  Resets the round counter to the restore target + 1, merges preserved
+     *  discoveries, compiles from the restored state, and injects the
+     *  backtrack prompt at the top.
+     *  MUTATES: session.currentRound, session.roundSnapshot,
+     *           session.currentPrompt, session.currentLevel,
+     *           session.consecutiveRejections, session.lastSelfEval */
+    private buildBacktrackResult;
+    /** Build a termination result: persist stopped status, notify sinks.
+     *  MUTATES: session.status, session.currentPrompt */
+    private buildTerminationResult;
+    /** Build a stop result: persist stopped/stalled status, notify sinks.
+     *  MUTATES: session.status, session.currentPrompt */
+    private buildStopResult;
+    /** Compile the next round's prompt and advance the session.
+     *  Includes the commit fence (pause/delete race guard) and context provider.
+     *  MUTATES: session.currentRound, session.currentPrompt, session.currentLevel,
+     *           session.evidenceBaseline, session.roundSnapshot */
+    private advanceToNextRound;
     private advanceUnlocked;
     /** Write back loop knowledge to long-term memory.
      *  Uses shared base builder from policy.ts. Called when a loop terminates. */

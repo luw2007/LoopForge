@@ -6,11 +6,15 @@
 
 import { createHash } from "node:crypto";
 import type {
-  CheckpointSummary,
+  ConstraintMeta,
   LoopCompileRequest,
   LoopCompileResponse,
+  MilestoneSummary,
+  SubGoal,
   VerificationFlag,
 } from "./protocol.js";
+import { unique } from "./token-utils.js";
+import { getPolicy } from "./policy.js";
 
 export const CANONICAL_STATE_SCHEMA_VERSION = 1 as const;
 
@@ -27,6 +31,10 @@ export interface CanonicalLoopState {
   hardConstraints: string[];
   activeConstraints: string[];
   retiredConstraints: string[];
+  /** v2.3: Constraints demoted to inactive after prolonged inactivity. */
+  inactiveConstraints: string[];
+  /** v2.3: Per-constraint lifecycle metadata. */
+  constraintMetadata: ConstraintMeta[];
   changesSinceLastRound: string[];
   remainingCriteria: string[];
   blockers: string[];
@@ -36,7 +44,18 @@ export interface CanonicalLoopState {
   rollingOutcomes: string[];
   recurringIssues: string[];
   failedPatterns: string[];
-  checkpoints: CheckpointSummary[];
+  /** v2.6: derived from agent_declared milestones. */
+  checkpoints: Array<{ label: string; declared_at_round: number; outcome: string; carried_constraints: string[]; resolved_constraints: string[] }>;
+  /** v2.1: Phase-boundary milestone summaries that survive window eviction. */
+  milestones: MilestoneSummary[];
+  /** v2.1: Single-paragraph loop-level synthesis (formulaic). */
+  loopSynthesis: string;
+  /** v2.2: Structured sub-goals with compiler-managed lifecycle. */
+  subGoals: SubGoal[];
+  /** v2.5: Agent trust score [0, 1] from verification flags. */
+  agentTrustScore: number | undefined;
+  /** v2.5: Trust trend over last 10 rounds. */
+  agentTrustTrend: number[];
   suggestedNextTask: string;
   externalContext: string;
   stateFilePath: string;
@@ -49,11 +68,7 @@ export interface CanonicalLoopState {
   };
 }
 
-function unique(values: Array<string | undefined | null>): string[] {
-  return [...new Set(values.filter((value): value is string =>
-    typeof value === "string" && value.trim().length > 0,
-  ).map((value) => value.trim()))];
-}
+// unique() imported from token-utils.ts
 
 /** Deterministic JSON serialization used by state and prompt hashes. */
 export function stableStringify(value: unknown): string {
@@ -81,6 +96,41 @@ function addList(lines: string[], title: string, values: string[]): void {
   lines.push("");
 }
 
+/** v2.11: Derive a stable 8-char hex ID from text using SHA-256.
+ *  Same hash strategy as computeGoalTextHash in loop-compiler.ts. */
+function deriveItemId(text: string): string {
+  return createHash("sha256").update(text.trim().replace(/\s+/g, " ").toLowerCase()).digest("hex").slice(0, 8);
+}
+
+/** v2.11: Render a list with ID prefixes when constraint_id_enabled is true.
+ *  Each item gets a [prefix-XXXXXXXX] tag derived from its text hash.
+ *  Items that already look like IDs (e.g. "cr-a3f2b1c0") are rendered as-is. */
+function addListWithIds(
+  lines: string[],
+  title: string,
+  values: string[],
+  prefix: string,
+): void {
+  if (values.length === 0) return;
+  const idEnabled = getPolicy().evolution.constraint_id_enabled;
+  lines.push(`## ${title}`, "");
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    // If the value is already an ID, render it as-is
+    const idRegex = /^(c|cr|sg)-[a-f0-9]{8}$/;
+    if (idRegex.test(trimmed)) {
+      lines.push(`- [\`${trimmed}\`] ${trimmed}`);
+    } else if (idEnabled) {
+      const id = prefix + "-" + deriveItemId(trimmed);
+      lines.push(`- [\`${id}\`] ${trimmed}`);
+    } else {
+      lines.push(`- ${trimmed}`);
+    }
+  }
+  lines.push("");
+}
+
 /** Human/Agent-readable materialized view. It is always reproducible from the
  * canonical state and is never consulted as transaction truth. */
 export function renderCanonicalStateMarkdown(state: CanonicalLoopState): string {
@@ -100,9 +150,10 @@ export function renderCanonicalStateMarkdown(state: CanonicalLoopState): string 
     state.currentTask,
     "",
   ];
-  addList(lines, "Success Criteria", state.successCriteria);
-  addList(lines, "Hard Constraints", state.hardConstraints);
-  addList(lines, "Active Constraints", state.activeConstraints);
+  // v2.11: Success Criteria and Constraints render with stable IDs for exact agent matching
+  addListWithIds(lines, "Success Criteria", state.successCriteria, "cr");
+  addListWithIds(lines, "Hard Constraints", state.hardConstraints, "c");
+  addListWithIds(lines, "Active Constraints", state.activeConstraints, "c");
   addList(lines, "Changes Since Last Round", state.changesSinceLastRound);
   if (
     state.progress.estimate !== null ||
@@ -131,13 +182,36 @@ export function renderCanonicalStateMarkdown(state: CanonicalLoopState): string 
     }
     lines.push("");
   }
-  addList(lines, "Remaining", state.remainingCriteria);
+  addListWithIds(lines, "Remaining", state.remainingCriteria, "cr");
   addList(lines, "Blockers", state.blockers);
   addList(lines, "Discoveries", state.discoveries);
   addList(lines, "Cross-Round Outcomes", state.rollingOutcomes);
   addList(lines, "Recurring Issues", state.recurringIssues);
   addList(lines, "Failed Patterns", state.failedPatterns);
   addList(lines, "Retired Constraints", state.retiredConstraints);
+  if (state.inactiveConstraints.length > 0) {
+    lines.push("## Inactive Constraints", "");
+    lines.push(
+      "> Demoted after prolonged inactivity. Removed from prompts ",
+      "but kept here. Auto-reactivated if violated again.",
+      "",
+    );
+    const idEnabled = getPolicy().evolution.constraint_id_enabled;
+    for (const c of state.inactiveConstraints) {
+      const meta = state.constraintMetadata.find((m) => m.text === c);
+      const age = meta
+        ? state.round - (meta.last_violated_at_round || meta.discovered_at_round || 0)
+        : "?";
+      const lastV = meta?.last_violated_at_round
+        ? `last violated R${meta.last_violated_at_round}`
+        : "never violated";
+      const idLabel = idEnabled && meta?.id
+        ? `[\`${meta.id}\`] `
+        : "";
+      lines.push(`- ${idLabel}${c} (${lastV}, ${age} rounds inactive)`);
+    }
+    lines.push("");
+  }
   if (state.nextAction) {
     lines.push("## Next Action", "", state.nextAction, "");
   }
@@ -147,6 +221,73 @@ export function renderCanonicalStateMarkdown(state: CanonicalLoopState): string 
       lines.push(`- [${flag.severity}] [${flag.check}] ${flag.detail}`);
     }
     lines.push("");
+  }
+  if (state.milestones.length > 0) {
+    lines.push("## Phase History", "");
+    for (const m of state.milestones) {
+      const kindIcon = m.kind === "agent_declared"
+        ? "🏁"
+        : m.kind === "criteria_milestone" ? "✅" : "📍";
+      lines.push(
+        `### ${kindIcon} ${m.label}`,
+        `Rounds ${m.round_range.start}–${m.round_range.end} | ` +
+        `Progress: ${(m.progress_at_boundary * 100).toFixed(0)}%`,
+        "",
+        `**Outcome**: ${m.outcome}`,
+        "",
+      );
+      if (m.carried_constraints.length > 0) {
+        lines.push("**Carried Constraints**:");
+        for (const c of m.carried_constraints) lines.push(`- ${c}`);
+        lines.push("");
+      }
+      if (m.resolved_constraints.length > 0) {
+        lines.push("**Resolved During Phase**:");
+        for (const c of m.resolved_constraints) lines.push(`- ${c}`);
+        lines.push("");
+      }
+    }
+  }
+  if (state.subGoals.length > 0) {
+    lines.push("## Sub-Goal Dashboard", "");
+    for (const sg of state.subGoals) {
+      const statusIcon =
+        sg.status === "in_progress" ? "🔄" :
+        sg.status === "done" ? "✅" :
+        sg.status === "blocked" ? "🚫" :
+        sg.status === "canceled" ? "❌" : "⏳";
+      const stale = sg.status === "pending" &&
+        state.round - sg.declared_at_round >= 10 ? " ⚠️ stale" : "";
+      const detail = sg.status === "done" && sg.completed_at_round
+        ? ` (done, R${sg.completed_at_round})`
+        : sg.status === "in_progress"
+        ? ` (since R${sg.status_changed_at_round})`
+        : sg.status === "pending"
+        ? ` (since R${sg.declared_at_round})`
+        : sg.status === "blocked"
+        ? ` (blocked R${sg.status_changed_at_round})`
+        : ` (canceled R${sg.status_changed_at_round})`;
+      lines.push(`- ${statusIcon} [\`${sg.id}\`] ${sg.description}${detail}${stale}`);
+    }
+    lines.push("");
+  }
+  if (state.agentTrustScore !== undefined) {
+    const barLen = 10;
+    const filled = Math.round(state.agentTrustScore * barLen);
+    const bar = "█".repeat(filled) + "░".repeat(barLen - filled);
+    const avg = state.agentTrustTrend.length > 0
+      ? (state.agentTrustTrend.reduce((a, b) => a + b, 0) / state.agentTrustTrend.length).toFixed(2)
+      : "—";
+    lines.push(
+      "## Agent Trust", "",
+      `${bar} ${(state.agentTrustScore * 100).toFixed(0)}%`,
+      `Trend (last ${state.agentTrustTrend.length}): ${state.agentTrustTrend.join(" → ")}`,
+      `Average: ${avg}`,
+      "",
+    );
+  }
+  if (state.loopSynthesis) {
+    lines.push("## Loop Summary", "", state.loopSynthesis, "");
   }
   if (state.externalContext) {
     lines.push("## External Context", "", state.externalContext, "");
@@ -198,6 +339,8 @@ export function createCanonicalLoopState(
     hardConstraints: unique(objective?.hard_constraints ?? []),
     activeConstraints: unique(response.constraints_active),
     retiredConstraints: unique(response.constraints_retired),
+    inactiveConstraints: unique(response.constraints_inactive ?? []),
+    constraintMetadata: response.constraint_metadata ?? [],
     changesSinceLastRound: changes,
     remainingCriteria: unique(
       last?.execution_evidence?.success_criteria_remaining ?? [],
@@ -209,9 +352,21 @@ export function createCanonicalLoopState(
     rollingOutcomes: unique(rolling?.key_outcomes ?? []),
     recurringIssues: unique(rolling?.recurring_issues ?? []),
     failedPatterns: unique(rolling?.failed_patterns ?? []),
-    checkpoints: response.checkpoint_summary
-      ? [response.checkpoint_summary]
-      : [],
+    // v2.5: checkpoints derived from agent_declared milestones (unified)
+    checkpoints: (rolling?.milestones ?? [])
+      .filter((m) => m.kind === "agent_declared")
+      .map((m) => ({
+        label: m.label,
+        declared_at_round: m.generated_at_round,
+        outcome: m.outcome,
+        carried_constraints: m.carried_constraints,
+        resolved_constraints: m.resolved_constraints,
+      })),
+    milestones: rolling?.milestones ?? [],
+    loopSynthesis: rolling?.loop_synthesis ?? "",
+    subGoals: response.sub_goals ?? [],
+    agentTrustScore: response.agent_trust_score,
+    agentTrustTrend: response.agent_trust_trend ?? [],
     suggestedNextTask: response.suggested_next_task,
     externalContext: request.external_context?.trim() ?? "",
     stateFilePath,

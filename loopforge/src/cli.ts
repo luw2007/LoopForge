@@ -10,7 +10,7 @@ import { FileLoopStore } from "./loop-store.js";
 import { getPolicy, validateLoopId, writeDefaultPolicy } from "./policy.js";
 import { McpServer } from "./mcp/server.js";
 
-const VERSION = "2.0.0-rc.1";
+const VERSION = "2.0.1";
 
 const HELP = `LoopForge ${VERSION}
 
@@ -42,7 +42,11 @@ function withoutPrompts(value: unknown): unknown {
   if (!value || typeof value !== "object") return value;
   const result: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
-    if (["promptArtifact", "renderedPrompt", "current_prompt", "full_prompt"].includes(key)) {
+    // Filter keys that contain "prompt" or "Prompt" (case-insensitive word
+    // boundary). Safer than a manual allow-list that must be updated for
+    // every new prompt-text field. prompt_artifact (meta only, no content)
+    // is preserved for audit visibility.
+    if (/\bprompt\b/i.test(key) && key !== "prompt_artifact" && key !== "promptArtifact") {
       continue;
     }
     result[key] = withoutPrompts(child);

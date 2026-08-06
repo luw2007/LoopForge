@@ -21,25 +21,22 @@ import type { SelfEvaluation, VerificationResult } from "./protocol.js";
  *  unambiguously means "not a valid round entry" in this context.
  *  Exported for reuse by enforcement-gate.ts. */
 export declare function entryRound(entry: VaultEntry): number;
-/** v1.17: Result of capturing git file state across all three categories. */
-export interface GitFileState {
-    /** Tracked files modified but unstaged (git diff --name-only). */
-    tracked: string[];
-    /** Files in the staging area (git diff --cached --name-only). */
-    staged: string[];
-    /** Untracked files not yet known to git (git ls-files --others --exclude-standard). */
-    untracked: string[];
+interface ParsedTestCounts {
+    passed: number;
+    failed: number;
+    skipped: number;
+    total: number;
 }
-/** v1.17: Capture all git file state — modified, staged, and untracked.
- *  Returns null if git is unavailable. Each list is sorted.
- *  5-second timeout per command prevents hanging on large repos. */
-export declare function captureGitFileState(): GitFileState | null;
-/** v1.16: Capture the current set of modified files according to git.
- *  Returns a sorted array of relative file paths, or null if git is unavailable.
- *  Delegates to `git diff --name-only` — no staging or committing.
- *  5-second timeout prevents hanging on large repos.
- *  @deprecated v1.17 — Use captureGitFileState() for full staged/untracked coverage. */
-export declare function captureGitModifiedFiles(): string[] | null;
+/** Best-effort parse of test counts from common test-runner output formats.
+ *
+ *  Scans the last 2000 characters of stdout (where summary lines typically
+ *  appear) and tries patterns in descending specificity order. Returns null
+ *  when the output format is unrecognized, stdout is empty, or a confident
+ *  parse cannot be made.
+ *
+ *  Recognized formats: Jest verbose/compact, Mocha, pytest/unittest, Go test,
+ *  and PHPUnit OK summaries. */
+export declare function parseTestOutput(stdout: string): ParsedTestCounts | null;
 /** Verify a SelfEvaluation against the loop's cross-round lineage.
  *
  * @param selfEval             The agent's self-evaluation for the current round.
@@ -47,12 +44,13 @@ export declare function captureGitModifiedFiles(): string[] | null;
  * @param vaultEntries         Vault entries for this loop (non-feedback only).
  * @param prevSelfEval         The agent's self-evaluation from the previous round
  *                             (null for round 1).
- * @param runtimeFilesChanged  v1.16: Files detected as changed by git diff between
- *                             before/after execute. null if git is unavailable.
- *                             Used by checkFilesIntegrity to cross-validate
- *                             agent-reported files_changed against reality.
  * @param evidenceSnapshots    v1.18: Evidence snapshots from configured providers.
  *                             Used by checkEvidenceIntegrity for multi-provider
  *                             cross-validation. Defaults to empty array. */
-export declare function verifySelfEvaluation(selfEval: SelfEvaluation, currentRound: number, vaultEntries: VaultEntry[], prevSelfEval?: SelfEvaluation | null, runtimeFilesChanged?: string[] | null, evidenceSnapshots?: ProviderSnapshot[]): VerificationResult;
+export declare function verifySelfEvaluation(selfEval: SelfEvaluation, currentRound: number, vaultEntries: VaultEntry[], prevSelfEval?: SelfEvaluation | null, evidenceSnapshots?: ProviderSnapshot[], 
+/** v2.13: Files from skipped backtrack rounds. If the agent's
+ *  files_changed overlaps significantly with these, the workspace
+ *  was not properly restored before working. */
+backtrackSkippedFiles?: string[]): VerificationResult;
+export {};
 //# sourceMappingURL=verification-gate.d.ts.map

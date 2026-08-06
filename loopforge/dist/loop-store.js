@@ -12,10 +12,8 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, s
 import { dirname, join, resolve } from "node:path";
 import { parseRoundTransactionSnapshot } from "./round-transaction.js";
 import { validateLoopId } from "./policy.js";
+import { isRecord } from "./token-utils.js";
 export const LOOP_STORE_SCHEMA_VERSION = 1;
-function isRecord(value) {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 function loopIdFromEntry(entry) {
     if (typeof entry.loop_id === "string" && entry.loop_id)
         return entry.loop_id;
@@ -76,7 +74,11 @@ export class FileLoopStore {
                             process.kill(owner.pid, 0);
                         }
                         catch (error) {
-                            stale = error.code !== "EPERM";
+                            // On Windows, EPERM may be returned for dead cross-user
+                            // processes. Treat as stale when the lock is old regardless.
+                            const code = error.code;
+                            stale = code === "ESRCH"
+                                || (code === "EPERM" && age > 10_000); // Windows safety: EPERM + old lock → stale
                         }
                     }
                 }
@@ -128,6 +130,10 @@ export class FileLoopStore {
             value.loopId !== loopId || !isRecord(value.entry))
             return null;
         return value;
+    }
+    writeSession(loopId, document) {
+        validateLoopId(loopId);
+        this.atomicWrite(join(this.loopDir(loopId), "session.json"), document);
     }
     readRound(loopId, round) {
         validateLoopId(loopId);
@@ -299,19 +305,17 @@ export class FileLoopStore {
         renameSync(temporary, path);
     }
 }
-/** Compatibility adapter for legacy internal query code. Persistent truth is
- * still the typed per-loop documents above; no Markdown lineage is written. */
+/** @deprecated Use LoopStore directly.
+ *
+ *  Compatibility adapter so modules that still accept VaultBackend can
+ *  operate on a LoopStore. Persistent truth is the typed per-loop
+ *  documents; no Markdown lineage is written. */
 export class LoopStoreBackend {
     store;
     constructor(store = new FileLoopStore()) {
         this.store = store;
     }
     withLock(fn) { return this.store.withLock(fn); }
-    readVault() { return { entries: this.store.listEntries() }; }
-    writeVault(data) {
-        const entries = Array.isArray(data.entries) ? data.entries.filter(isRecord) : [];
-        this.store.replaceEntries(entries);
-    }
     queryEntries(opts) {
         return this.store.listEntries().filter((entry) => {
             const taskId = String(entry.task_id ?? "");
@@ -328,5 +332,109 @@ export class LoopStoreBackend {
     }
     appendEntry(entry) { this.store.appendEntry(entry); }
     appendEntries(entries) { return this.store.appendEntries(entries); }
+}
+/** Adapter that wraps a VaultBackend as a LoopStore for backward compat.
+ *
+ *  SessionManager uses this when a VaultBackend is provided directly so
+ *  VaultSessionStateStore can operate on typed session documents while
+ *  the underlying storage remains VaultBackend entries. */
+export class VaultBackendLoopStore {
+    backend;
+    constructor(backend) {
+        this.backend = backend;
+    }
+    withLock(fn) {
+        return typeof this.backend.withLock === "function"
+            ? this.backend.withLock(fn)
+            : fn();
+    }
+    listLoopIds() {
+        return [...new Set(this.backend.queryEntries()
+                .filter((e) => typeof e.loop_id === "string")
+                .map((e) => e.loop_id))].sort();
+    }
+    listEntries(loopId) {
+        if (loopId)
+            return this.backend.queryEntries({ prefix: `loop:${loopId}` });
+        return this.backend.queryEntries();
+    }
+    appendEntry(entry) { this.backend.appendEntry(entry); }
+    appendEntries(entries) { return this.backend.appendEntries(entries); }
+    replaceEntries(_entries) {
+        throw new Error("VaultBackendLoopStore.replaceEntries is not supported. " +
+            "Use LoopStore (FileLoopStore) directly for bulk replace operations.");
+    }
+    readSession(loopId) {
+        const entry = this.backend.queryEntries({ prefix: `loop:${loopId}:session` })
+            .find((e) => e.task_type === "session_state" && e.loop_id === loopId);
+        if (!entry)
+            return null;
+        return {
+            schemaVersion: LOOP_STORE_SCHEMA_VERSION,
+            loopId,
+            updatedAt: typeof entry.timestamp === "string"
+                ? entry.timestamp
+                : new Date().toISOString(),
+            entry,
+        };
+    }
+    writeSession(loopId, document) {
+        const entry = document.entry;
+        // Ensure the entry carries identifying fields expected by queryEntries.
+        entry.task_type = "session_state";
+        entry.loop_id = loopId;
+        entry.task_id = `loop:${loopId}:session`;
+        // Session state lives in the vault entries list. The backend may
+        // provide readVault/writeVault as optional compat methods; if not,
+        // we fall back to appendEntry (which may create duplicates, but
+        // VaultSessionStateStore.load returns the first match).
+        const be = this.backend;
+        if (typeof be.readVault === "function" &&
+            typeof be.writeVault === "function") {
+            // Call via .call(be) so methods that reference `this` (e.g.
+            // MemoryBackend.readVault) keep their receiver.
+            const data = be.readVault.call(be);
+            const entries = Array.isArray(data.entries)
+                ? data.entries
+                : [];
+            const filtered = entries.filter((item) => !(item.task_type === "session_state" && item.loop_id === loopId));
+            be.writeVault.call(be, { entries: [...filtered, entry] });
+            return;
+        }
+        this.backend.appendEntry(entry);
+    }
+    readRound(loopId, round) {
+        const prefix = `loop:${loopId}:r${round}:`;
+        const entries = this.backend.queryEntries({ prefix });
+        if (entries.length === 0)
+            return null;
+        // Separate lineage, feedback, and raw events — same structure as
+        // FileLoopStore.readRound so callers get consistent round documents
+        // regardless of backend.
+        const lineage = entries.find((e) => e.task_type === "loop_lineage" || e.task_id === `loop:${loopId}:r${round}`);
+        const feedback = entries.find((e) => String(e.task_id ?? "").endsWith(":feedback"));
+        const events = entries.filter((e) => e !== lineage && e !== feedback);
+        let transaction;
+        const transactionRaw = feedback?.loop_lineage?.round_transaction ??
+            lineage?.loop_lineage?.round_transaction;
+        const transactionParsed = parseRoundTransactionSnapshot(isRecord(transactionRaw) ? transactionRaw.snapshot : undefined);
+        if (transactionParsed) {
+            transaction = transactionParsed;
+        }
+        return {
+            schemaVersion: LOOP_STORE_SCHEMA_VERSION,
+            loopId,
+            round,
+            updatedAt: entries[0].timestamp ?? new Date().toISOString(),
+            lineage: lineage,
+            feedback: feedback,
+            transaction,
+            promptArtifact: transaction?.promptArtifact,
+            events,
+        };
+    }
+    migrateLegacyVault(_path) {
+        return { source: _path ?? "vault", imported: 0, skipped: 0, alreadyMigrated: true };
+    }
 }
 //# sourceMappingURL=loop-store.js.map

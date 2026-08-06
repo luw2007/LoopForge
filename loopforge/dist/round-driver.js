@@ -61,6 +61,7 @@ export class RoundDriver {
             evidenceBaseline: rejected.beforeEvidence,
             snapshot,
             stateFileContent: response.state_file_content,
+            warnings: response.warnings,
         };
     }
     finishPrepare(response, loopId, round, evidenceBaseline) {
@@ -73,6 +74,7 @@ export class RoundDriver {
             evidenceBaseline,
             snapshot,
             stateFileContent: response.state_file_content,
+            warnings: response.warnings,
         };
     }
     async complete(input) {
@@ -88,6 +90,8 @@ export class RoundDriver {
             consecutiveRejections: input.consecutiveRejections,
             successTrajectory: input.successTrajectory,
             actualEvidence,
+            driftClarificationStreak: input.driftClarificationStreak,
+            backtrackSkippedFiles: input.backtrackSkippedFiles,
         });
         return { outcome, actualEvidence };
     }

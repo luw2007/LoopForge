@@ -13,11 +13,12 @@
  *                 must respond in the next round.
  */
 
-import { execSync } from "node:child_process";
 import type { VaultEntry } from "./backends/interface.js";
 import type { ProviderSnapshot } from "./evidence-provider.js";
+import { getPolicy } from "./policy.js";
 import type { SelfEvaluation, VerificationFlag, VerificationResult } from "./protocol.js";
 import { makeVerificationFlag, makeVerificationResult } from "./protocol.js";
+import { jaccardSimilarity, entryRound as sharedEntryRound } from "./token-utils.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helpers
@@ -29,8 +30,7 @@ import { makeVerificationFlag, makeVerificationResult } from "./protocol.js";
  *  unambiguously means "not a valid round entry" in this context.
  *  Exported for reuse by enforcement-gate.ts. */
 export function entryRound(entry: VaultEntry): number {
-  const lineage = (entry.loop_lineage ?? {}) as Record<string, unknown>;
-  return (lineage.round as number) ?? 0;
+  return sharedEntryRound(entry as unknown as Record<string, unknown>);
 }
 
 /** Read constraint_violations from a vault entry (entry-level, stored from
@@ -39,58 +39,6 @@ function entryViolations(entry: VaultEntry): string[] {
   const viols = entry.constraint_violations;
   if (Array.isArray(viols)) return viols.filter((v: unknown) => typeof v === "string");
   return [];
-}
-
-/** v1.17: Result of capturing git file state across all three categories. */
-export interface GitFileState {
-  /** Tracked files modified but unstaged (git diff --name-only). */
-  tracked: string[];
-  /** Files in the staging area (git diff --cached --name-only). */
-  staged: string[];
-  /** Untracked files not yet known to git (git ls-files --others --exclude-standard). */
-  untracked: string[];
-}
-
-/** v1.17: Capture all git file state — modified, staged, and untracked.
- *  Returns null if git is unavailable. Each list is sorted.
- *  5-second timeout per command prevents hanging on large repos. */
-export function captureGitFileState(): GitFileState | null {
-  try {
-    const trackedOut = execSync("git diff --name-only", {
-      encoding: "utf-8",
-      timeout: 5000,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const stagedOut = execSync("git diff --cached --name-only", {
-      encoding: "utf-8",
-      timeout: 5000,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const untrackedOut = execSync("git ls-files --others --exclude-standard", {
-      encoding: "utf-8",
-      timeout: 5000,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return {
-      tracked: trackedOut.trim().split("\n").filter(f => f.length > 0).sort(),
-      staged: stagedOut.trim().split("\n").filter(f => f.length > 0).sort(),
-      untracked: untrackedOut.trim().split("\n").filter(f => f.length > 0).sort(),
-    };
-  } catch {
-    return null;
-  }
-}
-
-/** v1.16: Capture the current set of modified files according to git.
- *  Returns a sorted array of relative file paths, or null if git is unavailable.
- *  Delegates to `git diff --name-only` — no staging or committing.
- *  5-second timeout prevents hanging on large repos.
- *  @deprecated v1.17 — Use captureGitFileState() for full staged/untracked coverage. */
-export function captureGitModifiedFiles(): string[] | null {
-  const state = captureGitFileState();
-  if (!state) return null;
-  // Merge all categories into a single sorted list (backward compat)
-  return [...new Set([...state.tracked, ...state.staged, ...state.untracked])].sort();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -281,36 +229,35 @@ function checkRetractFreshConstraint(
   return null;
 }
 
-/** v1.16: Check 7 — Agent-reported files_changed doesn't match git reality.
- *  Only fires when execution_evidence is present (structured self-eval path)
- *  AND runtimeFilesChanged is non-null (git is available). */
-function checkFilesIntegrity(
+/** v1.18: Cross-validate agent-reported files_changed against git evidence
+ *  from the configured evidence providers (ProviderSnapshot array). */
+function checkEvidenceIntegrity(
   selfEval: SelfEvaluation,
-  runtimeFilesChanged: string[] | null,
+  evidenceSnapshots: ProviderSnapshot[],
 ): VerificationFlag | null {
-  if (!runtimeFilesChanged) return null;  // git unavailable, skip
-  if (!selfEval.execution_evidence) return null;  // heuristic fallback, skip
+  if (!selfEval.execution_evidence) return null;
+  if (evidenceSnapshots.length === 0) return null;
+
+  const gitSnap = evidenceSnapshots.find((s) => s.provider === "git");
+  if (!gitSnap) return null;
 
   const reported = [...selfEval.execution_evidence.files_changed].sort();
-  const actual = [...runtimeFilesChanged].sort();
+  const actual = [...gitSnap.files].sort();
 
-  // Both empty → agent honestly reports no changes
   if (reported.length === 0 && actual.length === 0) return null;
 
-  // Agent says no files, but git shows changes
   if (reported.length === 0 && actual.length > 0) {
     return makeVerificationFlag({
       severity: "warn",
       field: "files_changed",
-      check: "files_integrity",
+      check: "evidence_integrity",
       detail:
-        `Agent reported no files changed but git shows: ${actual.join(", ")}`,
+        `Agent reported no files changed but evidence shows: ${actual.join(", ")}`,
     });
   }
 
-  // Compare reported vs actual
-  const ghostFiles = reported.filter(f => !actual.includes(f));
-  const missedFiles = actual.filter(f => !reported.includes(f));
+  const ghostFiles = reported.filter((f) => !actual.includes(f));
+  const missedFiles = actual.filter((f) => !reported.includes(f));
 
   if (ghostFiles.length > 0 || missedFiles.length > 0) {
     const parts: string[] = [];
@@ -319,78 +266,8 @@ function checkFilesIntegrity(
     return makeVerificationFlag({
       severity: "warn",
       field: "files_changed",
-      check: "files_integrity",
-      detail: `Agent files_changed doesn't match git: ${parts.join("; ")}`,
-    });
-  }
-
-  return null;
-}
-
-/** v1.18: Cross-validate agent-reported files_changed against evidence
- *  snapshots from all configured providers.
- *
- *  For the git provider: compares agent's execution_evidence.files_changed
- *  against the git snapshot's merged file list (same logic as
- *  checkFilesIntegrity but driven by ProviderSnapshot instead of
- *  raw string array).
- *
- *  For other providers: contributes an informational flag noting the
- *  provider ran but no structural cross-check is implemented yet. */
-function checkEvidenceIntegrity(
-  selfEval: SelfEvaluation,
-  evidenceSnapshots: ProviderSnapshot[],
-): VerificationFlag | null {
-  if (!selfEval.execution_evidence) return null;
-  if (evidenceSnapshots.length === 0) return null;
-
-  // Git provider cross-validation
-  const gitSnap = evidenceSnapshots.find((s) => s.provider === "git");
-  if (gitSnap) {
-    const reported = [...selfEval.execution_evidence.files_changed].sort();
-    const actual = [...gitSnap.files].sort();
-
-    if (reported.length === 0 && actual.length === 0) {
-      // Both empty — git is clean. Fall through to the
-      // non-git informational flag below instead of returning null early.
-    } else if (reported.length === 0 && actual.length > 0) {
-      return makeVerificationFlag({
-        severity: "warn",
-        field: "files_changed",
-        check: "evidence_integrity",
-        detail:
-          `Agent reported no files changed but evidence shows: ${actual.join(", ")}`,
-      });
-    } else {
-      const ghostFiles = reported.filter((f) => !actual.includes(f));
-      const missedFiles = actual.filter((f) => !reported.includes(f));
-
-      if (ghostFiles.length > 0 || missedFiles.length > 0) {
-        const parts: string[] = [];
-        if (ghostFiles.length > 0) parts.push(`unconfirmed: [${ghostFiles.join(", ")}]`);
-        if (missedFiles.length > 0) parts.push(`unreported: [${missedFiles.join(", ")}]`);
-        return makeVerificationFlag({
-          severity: "warn",
-          field: "files_changed",
-          check: "evidence_integrity",
-          detail: `Agent files_changed doesn't match evidence: ${parts.join("; ")}`,
-        });
-      }
-    }
-  }
-
-  // Non-git providers: emit an informational flag so the agent knows
-  // which providers ran. Structural cross-validation for non-git
-  // providers is not yet implemented; the flag is informational only.
-  const nonGitProviders = evidenceSnapshots
-    .filter((s) => s.provider !== "git")
-    .map((s) => s.provider);
-  if (nonGitProviders.length > 0) {
-    return makeVerificationFlag({
-      severity: "info",
-      field: "execution_evidence",
       check: "evidence_integrity",
-      detail: `Evidence providers ran: ${nonGitProviders.join(", ")}. Automated cross-validation of agent claims against these providers is not yet implemented.`,
+      detail: `Agent files_changed doesn't match evidence: ${parts.join("; ")}`,
     });
   }
 
@@ -425,6 +302,299 @@ function checkRequiredCommandEvidence(
   return null;
 }
 
+// ── Test output parsing ────────────────────────────────────────────────────
+
+// jaccardSimilarity() imported from token-utils.ts (v2.1 — intent-action drift detection)
+
+/** v2.1 (check 11): Compare the previous round's declared next_action with
+ *  the current round's actual output_summary. Detect when the agent says it
+ *  will do X but then does Y — silent drift without explanation.
+ *
+ *  Only fires when both next_action and output_summary are non-empty.
+ *  Uses configurable Jaccard token similarity threshold from policy. */
+function checkIntentDrift(
+  selfEval: SelfEvaluation,
+  prevSelfEval: SelfEvaluation | null,
+): VerificationFlag | null {
+  if (!prevSelfEval?.next_action?.trim()) return null;
+  if (!selfEval.output_summary.trim()) return null;
+
+  const intent = prevSelfEval.next_action.trim();
+  const actual = selfEval.output_summary.trim();
+  const score = jaccardSimilarity(intent, actual);
+
+  const threshold = getPolicy().evolution.intent_drift_threshold;
+  if (score >= threshold) return null;
+
+  return makeVerificationFlag({
+    severity: "warn",
+    field: "output_summary",
+    check: "intent_drift",
+    detail:
+      `Declared intent was "${intent.slice(0, 120)}" ` +
+      `but actual output "${actual.slice(0, 120)}" — ` +
+      `similarity ${(score * 100).toFixed(0)}% below threshold ${(threshold * 100).toFixed(0)}%`,
+  });
+}
+
+interface ParsedTestCounts {
+  passed: number;
+  failed: number;
+  skipped: number;
+  total: number;
+}
+
+/** Best-effort parse of test counts from common test-runner output formats.
+ *
+ *  Scans the last 2000 characters of stdout (where summary lines typically
+ *  appear) and tries patterns in descending specificity order. Returns null
+ *  when the output format is unrecognized, stdout is empty, or a confident
+ *  parse cannot be made.
+ *
+ *  Recognized formats: Jest verbose/compact, Mocha, pytest/unittest, Go test,
+ *  and PHPUnit OK summaries. */
+export function parseTestOutput(stdout: string): ParsedTestCounts | null {
+  if (!stdout) return null;
+  const tail = stdout.length > 2000 ? stdout.slice(-2000) : stdout;
+  let match: RegExpMatchArray | null;
+
+  // 1. Jest verbose: "Tests: 1 failed, 8 passed, 9 total"
+  match = tail.match(/Tests:\s*(\d+)\s+failed,\s*(\d+)\s+passed,\s*(\d+)\s+total/i);
+  if (match) {
+    return { failed: Number(match[1]), passed: Number(match[2]), total: Number(match[3]), skipped: 0 };
+  }
+
+  // 2. Jest compact: "Tests: 8 passed, 9 total"
+  match = tail.match(/Tests:\s*(\d+)\s+passed,\s*(\d+)\s+total/i);
+  if (match) {
+    const passed = Number(match[1]);
+    const total = Number(match[2]);
+    return { passed, failed: total - passed, total, skipped: 0 };
+  }
+
+  // 3. Mocha: "8 passing" + optional "2 failing"
+  const mochaPass = tail.match(/(\d+)\s+passing/i);
+  if (mochaPass) {
+    const mochaFail = tail.match(/(\d+)\s+failing/i);
+    const passed = Number(mochaPass[1]);
+    const failed = mochaFail ? Number(mochaFail[1]) : 0;
+    return { passed, failed, total: passed + failed, skipped: 0 };
+  }
+
+  // 4. Go test: count "--- PASS:" and "--- FAIL:" lines
+  const goPassCount = (tail.match(/---\s+PASS:/g) || []).length;
+  const goFailCount = (tail.match(/---\s+FAIL:/g) || []).length;
+  if (goPassCount > 0 || goFailCount > 0) {
+    return { passed: goPassCount, failed: goFailCount, total: goPassCount + goFailCount, skipped: 0 };
+  }
+
+  // 5. pytest / unittest: "8 passed, 1 failed" or "8 passed"
+  match = tail.match(/(\d+)\s+passed[,;\s]+(\d+)\s+failed/i);
+  if (match) {
+    return { passed: Number(match[1]), failed: Number(match[2]), total: Number(match[1]) + Number(match[2]), skipped: 0 };
+  }
+  // pytest compact: "8 passed" (with a reasonable context hint)
+  match = tail.match(/(?:=\s+test session|\b(?:passed|failed)\b)/i);
+  if (match) {
+    const pCount = tail.match(/(\d+)\s+passed/i);
+    const fCount = tail.match(/(\d+)\s+failed/i);
+    if (pCount || fCount) {
+      const passed = pCount ? Number(pCount[1]) : 0;
+      const failed = fCount ? Number(fCount[1]) : 0;
+      return { passed, failed, total: passed + failed, skipped: 0 };
+    }
+  }
+
+  // 6. PHPUnit: "OK (8 tests, 16 assertions)"
+  match = tail.match(/OK\s*\((\d+)\s+tests?/i);
+  if (match) {
+    const total = Number(match[1]);
+    return { passed: total, failed: 0, total, skipped: 0 };
+  }
+
+  return null;
+}
+
+/** Cross-validate agent-reported test_results against command evidence output.
+ *
+ *  For each command provider whose status is "passed" and output is not
+ *  truncated, attempts to parse test counts from stdout. Mismatched counts
+ *  produce a warn-level flag; failures hidden by the agent (reported 0 failed
+ *  when the command shows >0) produce an error-level flag.
+ *
+ *  Non-command evidence providers are skipped (no structural cross-check is
+ *  defined for them yet). */
+function checkCommandEvidenceIntegrity(
+  selfEval: SelfEvaluation,
+  evidenceSnapshots: ProviderSnapshot[],
+): VerificationFlag | null {
+  const reported = selfEval.execution_evidence?.test_results;
+  if (!reported) return null;
+
+  for (const snapshot of evidenceSnapshots) {
+    if (snapshot.data.kind !== "command") continue;
+    if (snapshot.data.status !== "passed") continue;
+    if (snapshot.data.truncated === true) continue;
+
+    const stdout = typeof snapshot.data.stdout === "string" ? snapshot.data.stdout : "";
+    const parsed = parseTestOutput(stdout);
+    if (!parsed) continue;
+
+    const mismatches: string[] = [];
+    if (parsed.passed !== reported.passed) {
+      mismatches.push(`passed: reported ${reported.passed}, command shows ${parsed.passed}`);
+    }
+    if (parsed.failed !== reported.failed) {
+      mismatches.push(`failed: reported ${reported.failed}, command shows ${parsed.failed}`);
+    }
+
+    if (mismatches.length === 0) {
+      // Counts match exactly — evidence supports the agent's claim.
+      continue;
+    }
+
+    const name = typeof snapshot.data.commandName === "string"
+      ? snapshot.data.commandName
+      : snapshot.provider;
+    // Agent hides failures → error. Other mismatch → warn.
+    const severity = parsed.failed > 0 && reported.failed === 0 ? "error" : "warn";
+
+    return makeVerificationFlag({
+      severity,
+      field: "test_results",
+      check: "command_evidence_mismatch",
+      detail: `Agent test_results don't match "${name}" output: ${mismatches.join("; ")}`,
+    });
+  }
+
+  return null;
+}
+
+/** v2.2: Check if the agent's declared next_action aligns with any pending
+ *  or in_progress sub-goal. When 3+ pending sub-goals exist but the agent
+ *  plans work unrelated to any of them, it may indicate task drift.
+ *  This is a warn-level advisory — the agent always owns prioritization. */
+function checkSubGoalDrift(
+  selfEval: SelfEvaluation,
+  prevSelfEval: SelfEvaluation | null,
+  vaultEntries: VaultEntry[],
+  currentRound: number,
+): VerificationFlag | null {
+  const nextAction = selfEval.next_action?.trim();
+  if (!nextAction) return null;
+
+  // Reconstruct pending sub-goal descriptions from vault entries
+  const pendingSubGoals = new Set<string>();
+  const completedOrCanceled = new Set<string>();
+  for (const entry of vaultEntries) {
+    const emerged = Array.isArray(entry.emerged_subtasks)
+      ? entry.emerged_subtasks.filter((v: unknown) => typeof v === "string")
+      : [];
+    for (const desc of emerged) {
+      pendingSubGoals.add(desc.trim());
+    }
+    const done = Array.isArray(entry.completed_subtasks)
+      ? entry.completed_subtasks.filter((v: unknown) => typeof v === "string")
+      : [];
+    for (const desc of done) {
+      completedOrCanceled.add(desc.trim());
+    }
+    const canceled = Array.isArray(entry.canceled_subtasks)
+      ? entry.canceled_subtasks.filter((v: unknown) => typeof v === "string")
+      : [];
+    for (const desc of canceled) {
+      completedOrCanceled.add(desc.trim());
+    }
+  }
+  // Also process current selfEval
+  for (const desc of selfEval.emerged_subtasks ?? []) {
+    pendingSubGoals.add(desc.trim());
+  }
+  for (const desc of selfEval.completed_subtasks ?? []) {
+    completedOrCanceled.add(desc.trim());
+  }
+  for (const desc of selfEval.canceled_subtasks ?? []) {
+    completedOrCanceled.add(desc.trim());
+  }
+
+  // Remove completed/canceled from pending
+  for (const desc of completedOrCanceled) {
+    pendingSubGoals.delete(desc);
+  }
+
+  // Need at least 3 pending sub-goals for the check to be meaningful
+  if (pendingSubGoals.size < 3) return null;
+
+  // Check if next_action aligns with any pending sub-goal
+  let aligns = false;
+  for (const sg of pendingSubGoals) {
+    const score = jaccardSimilarity(nextAction, sg);
+    if (score >= getPolicy().evolution.subgoal_drift_alignment_threshold) {
+      aligns = true;
+      break;
+    }
+  }
+
+  if (!aligns) {
+    const sample = [...pendingSubGoals].slice(0, 3).join(", ");
+    return makeVerificationFlag({
+      severity: "warn",
+      field: "next_action",
+      check: "subgoal_drift",
+      detail:
+        `Agent's next_action doesn't align with any of ${pendingSubGoals.size} pending sub-goals. ` +
+        `Pending: ${sample}… Consider completing existing sub-goals before starting new work, ` +
+        `or cancel outdated sub-goals via canceled_subtasks.`,
+    });
+  }
+
+  return null;
+}
+
+/** v2.13: After a backtrack, check that the agent restored the workspace
+ *  before working. If the agent's files_changed overlaps with files from
+ *  skipped (failed) rounds, the workspace was likely not clean. */
+function checkBacktrackWorkspaceRestore(
+  selfEval: SelfEvaluation,
+  backtrackSkippedFiles: string[],
+): VerificationFlag | null {
+  if (backtrackSkippedFiles.length === 0) return null;
+
+  const ev = selfEval.execution_evidence;
+  if (!ev || ev.files_changed.length === 0) return null;
+
+  // Check overlap: files the agent changed vs. files from skipped rounds
+  const overlap = ev.files_changed.filter((f) =>
+    backtrackSkippedFiles.some((sf) => sf === f || f.endsWith(sf) || sf.endsWith(f)),
+  );
+
+  if (overlap.length === 0) return null;
+
+  // Agent is modifying files that were part of failed rounds without
+  // having properly restored the workspace first.
+  if (overlap.length >= 3 || overlap.length === ev.files_changed.length) {
+    return makeVerificationFlag({
+      severity: "error",
+      field: "files_changed",
+      check: "backtrack_workspace_not_restored",
+      detail:
+        `Agent modified ${overlap.length} file(s) that were part of ` +
+        `the skipped (failed) rounds: ${overlap.slice(0, 5).join(", ")}. ` +
+        `The workspace was likely not restored before working.`,
+    });
+  }
+
+  // Minor overlap — warn only
+  return makeVerificationFlag({
+    severity: "warn",
+    field: "files_changed",
+    check: "backtrack_workspace_not_restored",
+    detail:
+      `Agent modified files that overlap with skipped rounds: ` +
+      `${overlap.join(", ")}. Verify the workspace was restored.`,
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Main entry point
 // ═══════════════════════════════════════════════════════════════════════════
@@ -436,10 +606,6 @@ function checkRequiredCommandEvidence(
  * @param vaultEntries         Vault entries for this loop (non-feedback only).
  * @param prevSelfEval         The agent's self-evaluation from the previous round
  *                             (null for round 1).
- * @param runtimeFilesChanged  v1.16: Files detected as changed by git diff between
- *                             before/after execute. null if git is unavailable.
- *                             Used by checkFilesIntegrity to cross-validate
- *                             agent-reported files_changed against reality.
  * @param evidenceSnapshots    v1.18: Evidence snapshots from configured providers.
  *                             Used by checkEvidenceIntegrity for multi-provider
  *                             cross-validation. Defaults to empty array. */
@@ -448,8 +614,11 @@ export function verifySelfEvaluation(
   currentRound: number,
   vaultEntries: VaultEntry[],
   prevSelfEval: SelfEvaluation | null = null,
-  runtimeFilesChanged: string[] | null = null,
   evidenceSnapshots: ProviderSnapshot[] = [],
+  /** v2.13: Files from skipped backtrack rounds. If the agent's
+   *  files_changed overlaps significantly with these, the workspace
+   *  was not properly restored before working. */
+  backtrackSkippedFiles: string[] = [],
 ): VerificationResult {
   const flags: VerificationFlag[] = [];
 
@@ -468,11 +637,17 @@ export function verifySelfEvaluation(
     () => checkDuplicateConstraintDiscovery(selfEval, prevSelfEval, olderViolations),
     () => checkRecurringViolation(selfEval, prevSelfEval, vaultEntries, currentRound),
     () => checkRetractFreshConstraint(selfEval, prevSelfEval, currentRound),
-    // v1.16: Cross-validate agent-reported files_changed against git reality
-    () => checkFilesIntegrity(selfEval, runtimeFilesChanged),
-    // v1.18: Cross-validate against evidence snapshots from all providers
+    // v1.18: Cross-validate agent-reported files_changed against git evidence
     () => checkEvidenceIntegrity(selfEval, evidenceSnapshots),
     () => checkRequiredCommandEvidence(selfEval, evidenceSnapshots),
+    // v2.0: Cross-validate agent-reported test_results against command output
+    () => checkCommandEvidenceIntegrity(selfEval, evidenceSnapshots),
+    // v2.1: Detect intent-action drift — agent said X but did Y
+    () => checkIntentDrift(selfEval, prevSelfEval),
+    // v2.2: Detect sub-goal drift — next_action doesn't align with pending sub-goals
+    () => checkSubGoalDrift(selfEval, prevSelfEval, vaultEntries, currentRound),
+    // v2.13: Post-backtrack workspace restore check
+    () => checkBacktrackWorkspaceRestore(selfEval, backtrackSkippedFiles),
   ];
 
   for (const run of checks) {

@@ -1,7 +1,7 @@
 /** RoundCoordinator — Unified round-boundary state machine (v1.17).
  *
- * Encapsulates the shared round processing pipeline used by both
- * LoopRuntime (runtime.ts) and SessionManager (mcp/session.ts):
+ * Encapsulates the shared round processing pipeline used by
+ * SessionManager (mcp/session.ts):
  *
  *   verify → enforce → stop decision
  *
@@ -27,10 +27,16 @@ import type {
   VerificationFlag,
   VerificationResult,
 } from "./protocol.js";
-import { verifySelfEvaluation } from "./verification-gate.js";
-import { enforceRound, buildRejectionPrompt } from "./enforcement-gate.js";
+import { verifySelfEvaluation, entryRound } from "./verification-gate.js";
+import {
+  enforceRound,
+  buildRejectionPrompt,
+  findSafeRestorePoint,
+  buildBacktrackPrompt,
+} from "./enforcement-gate.js";
 import { logEvent } from "./observability.js";
 import { getPolicy } from "./policy.js";
+
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -48,26 +54,35 @@ export interface RoundProcessInput {
   lastSelfEval?: SelfEvaluation;
   /** How many consecutive rounds have been rejected by enforcement. */
   consecutiveRejections: number;
-  /** v1.16: Files detected as changed by git diff. null if git unavailable. */
-  runtimeFilesChanged?: string[] | null;
   /** v1.18: Evidence snapshots from configured providers. */
   evidenceSnapshots?: ProviderSnapshot[];
   /** Success values from already committed rounds. */
   successTrajectory?: boolean[];
+  /** v2.13: Files from skipped backtrack rounds. Passed to verification
+   *  gate for post-backtrack workspace restore check. */
+  backtrackSkippedFiles?: string[];
 }
 
 /** Result of processing a round through the coordinator. */
 export interface RoundProcessResult {
   /** What the caller should do next. */
-  action: "continue" | "stop" | "reject" | "terminate";
+  action: "continue" | "stop" | "reject" | "terminate" | "backtrack";
   /** Reason for stop (set when action is "stop" or "terminate"). */
   stopReason?: StopReason;
   /** Rejection prompt (set when action is "reject"). */
   rejectionPrompt?: string;
+  /** v2.10: Backtrack prompt (set when action is "backtrack"). */
+  backtrackPrompt?: string;
+  /** v2.10: Round to restore state from (set when action is "backtrack"). */
+  backtrackTarget?: number;
+  /** v2.10: Discovered constraints from skipped rounds to preserve. */
+  backtrackSkippedDiscoveries?: string[];
+  /** v2.10: Which enforcement rule triggered the backtrack. */
+  backtrackTriggerRule?: string;
   /** Verification flags from this round (for injection into next prompt). */
   verificationFlags: VerificationFlag[];
   /** Enforcement action for observability. */
-  enforcementAction?: "accept" | "reject" | "terminate";
+  enforcementAction?: "accept" | "reject" | "terminate" | "backtrack";
   /** Enforcement reason (set when rejected or terminated). */
   enforcementReason?: string;
   /** Whether this round was successful (from selfEval.success). */
@@ -85,6 +100,17 @@ export interface RoundProcessResult {
   /** Whether the caller should push roundSuccess onto the success trajectory.
    *  false when gateContradicted or when action is "reject". */
   shouldPushSuccessTrajectory: boolean;
+  /** v2.12: True when this round's intent_drift was waived via substantive
+   *  drift_clarification. The caller uses this to track clarification streaks. */
+  clarificationAccepted?: boolean;
+  /** v2.13: Git HEAD commit hash of the backtrack target round.
+   *  Set when action is "backtrack". The verification gate uses this
+   *  to check that the agent restored the workspace before working. */
+  backtrackTargetGitHead?: string;
+  /** v2.13: Files changed in skipped rounds during backtrack.
+   *  The next round's verification gate checks that these files are
+   *  not still dirty (agent must restore workspace first). */
+  backtrackSkippedFiles?: string[];
 }
 
 // ── RoundCoordinator ───────────────────────────────────────────────────────
@@ -99,27 +125,40 @@ export class RoundCoordinator {
   /** Process a single round's self-evaluation through the decision pipeline:
    *  verify → enforce → stop decision.
    *
-   *  This is the single entry point called by both LoopRuntime and
-   *  SessionManager. The caller is responsible for:
+   *  This is the single entry point called by SessionManager.
+   *  The caller is responsible for:
    *  - Compiling the next prompt (if action is "continue")
    *  - Managing heartbeat / signal handlers (runtime only)
    *  - Memory injection (both paths, before calling processRound)
    *  - Transactional feedback commit (accepted rounds only)
    *  - State file I/O (both paths, after compiling)
-   */
-  processRound(input: RoundProcessInput): RoundProcessResult {
+   *
+   * @param driftClarificationStreak v2.12: Current clarification streak
+   *  from session state. Passed through to enforceRound for R7 escalation. */
+  processRound(
+    input: RoundProcessInput,
+    driftClarificationStreak: number = 0,
+  ): RoundProcessResult {
     const {
       loopId, task, currentRound, maxRounds,
       selfEval, extractionSucceeded, lastSelfEval,
-      consecutiveRejections, runtimeFilesChanged,
+      consecutiveRejections,
       evidenceSnapshots,
     } = input;
 
     const roundSuccess = selfEval.success ?? false;
 
     // ── 1. Query vault entries ──────────────────────────────────────────
+    // Lineage entries (constraint violations, output summaries) and feedback
+    // entries (execution_evidence, progress estimates) are both needed by
+    // the enforcement gate. queryEntries excludes feedback by default, so
+    // we issue a second query and merge both result sets.
+    const prefix = `loop:${loopId}:r`;
     const vaultEntries: VaultEntry[] = this.backend
-      ? this.backend.queryEntries({ prefix: `loop:${loopId}:r` })
+      ? [
+          ...this.backend.queryEntries({ prefix }),
+          ...this.backend.queryEntries({ prefix, feedbackOnly: true }),
+        ]
       : [];
 
     // ── 2. Verification gate ────────────────────────────────────────────
@@ -128,8 +167,8 @@ export class RoundCoordinator {
       currentRound,
       vaultEntries,
       lastSelfEval ?? null,
-      runtimeFilesChanged ?? null,
       evidenceSnapshots ?? [],
+      input.backtrackSkippedFiles ?? [],
     );
     const verificationFlags = verifyResult.flags;
     const gateContradicted = verifyResult.verdict === "contradicted";
@@ -142,47 +181,76 @@ export class RoundCoordinator {
       });
     }
 
-    // ── 3. Enforcement gate (structured extractions only) ───────────────
-    // Heuristic evaluations have no reliable execution_evidence —
-    // enforcement rules that depend on evidence are skipped.
-    if (extractionSucceeded) {
-      const enforceResult: EnforcementResult = enforceRound(
-        selfEval,
-        verifyResult,
-        currentRound,
-        vaultEntries,
-        consecutiveRejections,
+    // ── 3. Enforcement gate ──────────────────────────────────────────
+    // v2.5: heuristic extractions now run partial enforcement. Rules that
+    // depend on execution_evidence (R3/R4/R5) self-skip when evidence is
+    // missing. Rules that don't need evidence (R1/R2/R6/R7) always run.
+    const enforceResult: EnforcementResult = enforceRound(
+      selfEval,
+      verifyResult,
+      currentRound,
+      vaultEntries,
+      consecutiveRejections,
+      !extractionSucceeded,
+      driftClarificationStreak,
+    );
+
+    if (enforceResult.action === "reject") {
+      const newRejections = consecutiveRejections + 1;
+      const rejectionPrompt = buildRejectionPrompt(
+        currentRound, task, enforceResult, verificationFlags,
       );
+      logEvent("enforcement_reject", {
+        loopId,
+        round: currentRound,
+        reason: enforceResult.reason.slice(0, 120),
+        check: enforceResult.check ?? "",
+        consecutiveRejections: newRejections,
+      });
+      return {
+        action: "reject",
+        rejectionPrompt,
+        verificationFlags,
+        enforcementAction: "reject",
+        enforcementReason: enforceResult.reason,
+        rejectionCheck: enforceResult.check,
+        roundSuccess,
+        gateContradicted,
+        newConsecutiveRejections: newRejections,
+        // Don't update lastSelfEval on reject — the agent redoes the same round
+        newLastSelfEval: undefined,
+        shouldPushSuccessTrajectory: false,
+      };
+    }
 
-      if (enforceResult.action === "reject") {
-        const newRejections = consecutiveRejections + 1;
-        const rejectionPrompt = buildRejectionPrompt(
-          currentRound, task, enforceResult,
-        );
-        logEvent("enforcement_reject", {
-          loopId,
-          round: currentRound,
-          reason: enforceResult.reason.slice(0, 120),
-          check: enforceResult.check ?? "",
-          consecutiveRejections: newRejections,
-        });
-        return {
-          action: "reject",
-          rejectionPrompt,
-          verificationFlags,
-          enforcementAction: "reject",
-          enforcementReason: enforceResult.reason,
-          rejectionCheck: enforceResult.check,
-          roundSuccess,
-          gateContradicted,
-          newConsecutiveRejections: newRejections,
-          // Don't update lastSelfEval on reject — the agent redoes the same round
-          newLastSelfEval: undefined,
-          shouldPushSuccessTrajectory: false,
-        };
-      }
+    if (enforceResult.action === "terminate") {
+      logEvent("session_end", {
+        loopId,
+        stopReason: "enforcement_terminated",
+        round: currentRound,
+      });
+      return {
+        action: "terminate",
+        stopReason: "enforcement_terminated",
+        verificationFlags,
+        enforcementAction: "terminate",
+        enforcementReason: enforceResult.reason,
+        rejectionCheck: enforceResult.check,
+        roundSuccess,
+        gateContradicted,
+        newConsecutiveRejections: 0,
+        newLastSelfEval: selfEval,
+        shouldPushSuccessTrajectory: false,
+      };
+    }
 
-      if (enforceResult.action === "terminate") {
+    // ── v2.10: Backtrack ──────────────────────────────────────────────────
+    if (enforceResult.action === "backtrack") {
+      const maxDepth = getPolicy().engine.backtrack_max_depth;
+      const restorePoint = findSafeRestorePoint(currentRound, vaultEntries, maxDepth);
+
+      if (!restorePoint) {
+        // No clean round found within maxDepth — fall through to terminate
         logEvent("session_end", {
           loopId,
           stopReason: "enforcement_terminated",
@@ -193,7 +261,8 @@ export class RoundCoordinator {
           stopReason: "enforcement_terminated",
           verificationFlags,
           enforcementAction: "terminate",
-          enforcementReason: enforceResult.reason,
+          enforcementReason:
+            `${enforceResult.reason} (backtrack failed: no clean restore point within ${maxDepth} rounds)`,
           rejectionCheck: enforceResult.check,
           roundSuccess,
           gateContradicted,
@@ -203,9 +272,63 @@ export class RoundCoordinator {
         };
       }
 
-      // Accept: reset rejection counter
-      // (consecutiveRejections reset to 0 — caller persists)
+      // v2.13: Collect files changed in skipped rounds for the restore prompt
+      const skippedFiles: string[] = [];
+      for (let r = restorePoint.round + 1; r < currentRound; r++) {
+        const entry = vaultEntries.find((e) => entryRound(e) === r);
+        if (entry?.execution_evidence) {
+          const ev = entry.execution_evidence as Record<string, unknown>;
+          const files = Array.isArray(ev.files_changed)
+            ? ev.files_changed.filter((f: unknown) => typeof f === "string")
+            : [];
+          for (const f of files) {
+            if (!skippedFiles.includes(f)) skippedFiles.push(f);
+          }
+        }
+      }
+
+      const backtrackPrompt = buildBacktrackPrompt(
+        currentRound,
+        restorePoint.round,
+        enforceResult.check ?? "progress_stall",
+        getPolicy().engine.backtrack_preserve_discoveries
+          ? restorePoint.skippedDiscoveries
+          : [],
+        skippedFiles,
+      );
+
+      logEvent("enforcement_backtrack", {
+        loopId,
+        round: currentRound,
+        reason: enforceResult.reason.slice(0, 120),
+        check: enforceResult.check ?? "",
+        backtrackTarget: restorePoint.round,
+        skippedDiscoveries: restorePoint.skippedDiscoveries.length,
+      });
+
+      return {
+        action: "backtrack",
+        backtrackPrompt,
+        backtrackTarget: restorePoint.round,
+        backtrackSkippedDiscoveries: getPolicy().engine.backtrack_preserve_discoveries
+          ? restorePoint.skippedDiscoveries
+          : [],
+        backtrackSkippedFiles: skippedFiles,
+        backtrackTriggerRule: enforceResult.check,
+        verificationFlags,
+        enforcementAction: "backtrack",
+        enforcementReason: enforceResult.reason,
+        rejectionCheck: enforceResult.check,
+        roundSuccess,
+        gateContradicted,
+        newConsecutiveRejections: 0, // reset — fresh start
+        newLastSelfEval: undefined,
+        shouldPushSuccessTrajectory: false,
+      };
     }
+
+    // Accept: reset rejection counter
+    // (consecutiveRejections reset to 0 — caller persists)
 
     // ── 4. Auto-feedback (AFTER enforcement, only if accepted) ──────────
     // ── 5. Stop condition checks ────────────────────────────────────────
@@ -226,7 +349,14 @@ export class RoundCoordinator {
 
     // 5b. Agent says stop
     if (!selfEval.should_continue) {
-      const reason = roundSuccess ? "completed" : "failed";
+      let reason: StopReason;
+      if (roundSuccess) {
+        reason = "completed";
+      } else if (selfEval.stop_reason === "blocked" || selfEval.stop_reason === "needs_human_input") {
+        reason = "blocked";
+      } else {
+        reason = "failed";
+      }
       return {
         action: "stop",
         stopReason: reason,
@@ -239,27 +369,14 @@ export class RoundCoordinator {
       };
     }
 
-    // 5c. Circuit breaker
-    const projectedTrajectory = [...(input.successTrajectory ?? [])];
-    if (!gateContradicted) projectedTrajectory.push(roundSuccess);
-    const breakerSize = getPolicy().engine.max_circuit_breaker;
-    const circuitBroken =
-      projectedTrajectory.length >= breakerSize &&
-      projectedTrajectory.slice(-breakerSize).every((value) => !value);
-    if (circuitBroken) {
-      return {
-        action: "stop",
-        stopReason: "circuit_breaker",
-        verificationFlags,
-        roundSuccess,
-        gateContradicted,
-        newConsecutiveRejections: 0,
-        newLastSelfEval: selfEval,
-        shouldPushSuccessTrajectory: !gateContradicted,
-      };
-    }
-
-    // 5d. Max rounds reached
+    // 5c. Max rounds reached
+    //
+    // NOTE: The binary-success circuit breaker previously at 5c is removed.
+    // Genuine agent stalls are now detected by the enforcement gate via
+    // enforceProgressStall (R4: delta < 5% → reject → terminate on repeat)
+    // and enforceProgressStallTerminal (R5: delta = 0 for N rounds → terminate).
+    // These use progress_estimate, not the binary success flag, so they
+    // correctly distinguish "task not done yet" from "agent is stuck".
     if (currentRound >= maxRounds) {
       return {
         action: "stop",
@@ -283,6 +400,8 @@ export class RoundCoordinator {
       newConsecutiveRejections: 0,
       newLastSelfEval: selfEval,
       shouldPushSuccessTrajectory: !gateContradicted,
+      // v2.12: Propagate clarification acceptance signal for streak tracking
+      clarificationAccepted: enforceResult.clarification_accepted ?? false,
     };
   }
 }

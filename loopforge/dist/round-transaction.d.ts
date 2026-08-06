@@ -40,6 +40,10 @@ export interface RoundTransactionInput {
     lastSelfEval?: SelfEvaluation;
     consecutiveRejections: number;
     successTrajectory: boolean[];
+    /** v2.12: Current clarification streak for R7 escalation. */
+    driftClarificationStreak?: number;
+    /** v2.13: Files from skipped backtrack rounds for restore check. */
+    backtrackSkippedFiles?: string[];
     actualEvidence: ProviderSnapshot[];
 }
 export interface RoundTransactionOutcome {

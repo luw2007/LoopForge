@@ -1,6 +1,7 @@
 /** Tests for enforcement-gate — Layer 2 round-boundary runtime enforcement. */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { getPolicy, resetPolicy } from "../policy.js";
 import {
   makeEnforcementResult,
   makeExecutionEvidence,
@@ -12,7 +13,13 @@ import {
   type VerificationResult,
 } from "../protocol.js";
 import type { VaultEntry } from "../backends/interface.js";
-import { enforceRound, buildRejectionPrompt } from "../enforcement-gate.js";
+import {
+  enforceRound,
+  buildRejectionPrompt,
+  findSafeRestorePoint,
+  buildBacktrackPrompt,
+} from "../enforcement-gate.js";
+import { verifyBacktrackPrompt } from "./_backtrack-asserts.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helpers
@@ -273,7 +280,7 @@ describe("enforcement-gate — R4: progress stall", () => {
     assert.equal(result.action, "accept");
   });
 
-  it("terminates on second consecutive stall rejection", () => {
+  it("backtracks on second consecutive stall rejection instead of terminating", () => {
     const curr = se({
       success: false,
       execution_evidence: makeExecutionEvidence({
@@ -286,10 +293,31 @@ describe("enforcement-gate — R4: progress stall", () => {
       vaultRound(2, 0.31),
       vaultRound(3, 0.32),
     ];
-    // consecutiveRejections=1 (was already rejected once before)
+    // v2.10: consecutiveRejections=1 + escalation + backtrack_enabled → backtrack
+    // instead of v2.7's escalated reject. The agent is rolled back to the
+    // last clean round rather than redoing the same round with guidance.
     const result = enforceRound(curr, trusted(), 4, vault, 1);
+    assert.equal(result.action, "backtrack");
+    assert.equal(result.check, "progress_stall");
+  });
+
+  it("terminates on third consecutive stall rejection after escalation", () => {
+    const curr = se({
+      success: false,
+      execution_evidence: makeExecutionEvidence({
+        files_changed: ["src/foo.ts"],
+        progress_estimate: 0.33,
+      }),
+    });
+    const vault = [
+      vaultRound(1, 0.30),
+      vaultRound(2, 0.31),
+      vaultRound(3, 0.32),
+    ];
+    // v2.7: consecutiveRejections=2 → terminate (escalation already given)
+    const result = enforceRound(curr, trusted(), 4, vault, 2);
     assert.equal(result.action, "terminate");
-    assert.ok(result.reason.includes("previous rejection"));
+    assert.equal(result.check, "progress_stall");
   });
 
   it("does not fire with less than 3 rounds of vault data", () => {
@@ -310,14 +338,25 @@ describe("enforcement-gate — R4: progress stall", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("enforcement-gate — R5: max rejections", () => {
-  it("terminates after 2 consecutive rejections", () => {
+  it("escalates after 2 consecutive rejections instead of terminating", () => {
     const curr = se({ success: false });
+    // v2.7: consecutiveRejections=2 now escalates (reject + guidance) instead
+    // of terminating immediately.
     const result = enforceRound(curr, trusted(), 3, [], 2);
+    assert.equal(result.action, "reject");
+    assert.ok(result.fix_instructions.includes("Escalation"));
+    assert.equal(result.check, "max_rejections");
+  });
+
+  it("terminates after 3 consecutive rejections", () => {
+    const curr = se({ success: false });
+    // v2.7: consecutiveRejections=3 → terminate (escalation already given)
+    const result = enforceRound(curr, trusted(), 3, [], 3);
     assert.equal(result.action, "terminate");
     assert.ok(result.reason.includes("consecutive enforcement rejections"));
   });
 
-  it("does not terminate with only 1 rejection", () => {
+  it("does not escalate with only 1 rejection", () => {
     const curr = se({ success: false });
     const result = enforceRound(curr, trusted(), 3, [], 1);
     assert.equal(result.action, "accept");
@@ -380,5 +419,562 @@ describe("buildRejectionPrompt", () => {
     });
     const prompt = buildRejectionPrompt(2, "Fix bugs in auth module", enforceResult);
     assert.ok(prompt.includes("Fix bugs in auth module"));
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v2.8: R7 — Intent drift with drift_clarification
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("enforceRound — R7 intent drift with clarification", () => {
+  it("rejects when intent_drift flag present without clarification", () => {
+    const selfEval = makeSelfEvaluation({
+      success: false,
+      output_summary: "Fixed CSS padding",
+      should_continue: true,
+    });
+    const verifyResult = makeVerificationResult({
+      verdict: "suspect",
+      flags: [
+        makeVerificationFlag({
+          severity: "warn",
+          field: "output_summary",
+          check: "intent_drift",
+          detail: "Declared intent was refactor auth but actual output fixed css — similarity 8%",
+        }),
+      ],
+    });
+    const result = enforceRound(selfEval, verifyResult, 3, [], 0);
+    assert.equal(result.action, "reject", "should reject without clarification");
+    assert.equal(result.check, "intent_drift");
+  });
+
+  it("accepts (skips reject) when agent provides substantive drift_clarification", () => {
+    const selfEval = makeSelfEvaluation({
+      success: false,
+      output_summary: "Fixed CSS padding",
+      should_continue: true,
+      drift_clarification:
+        "Pivoted from auth refactor because data showed CSS layout was the actual user complaint. " +
+        "The auth module refactor was preempted by this higher-priority fix. " +
+        "Changed src/components/Login.css to fix the visual regression.",
+    });
+    const verifyResult = makeVerificationResult({
+      verdict: "suspect",
+      flags: [
+        makeVerificationFlag({
+          severity: "warn",
+          field: "output_summary",
+          check: "intent_drift",
+          detail: "Declared intent was refactor auth but actual output fixed css — similarity 8%",
+        }),
+      ],
+    });
+    const result = enforceRound(selfEval, verifyResult, 3, [], 0);
+    assert.notEqual(result.action, "reject",
+      "should not reject when clarification is provided");
+    // v2.12: Should signal clarification was accepted
+    assert.equal(result.clarification_accepted, true,
+      "should mark clarification as accepted");
+  });
+
+  it("rejects when drift_clarification is too short (under 20 chars)", () => {
+    const selfEval = makeSelfEvaluation({
+      success: false,
+      output_summary: "Fixed CSS padding",
+      should_continue: true,
+      drift_clarification: "Changed plan.",
+    });
+    const verifyResult = makeVerificationResult({
+      verdict: "suspect",
+      flags: [
+        makeVerificationFlag({
+          severity: "warn",
+          field: "output_summary",
+          check: "intent_drift",
+          detail: "Declared intent was refactor auth but actual output fixed css — similarity 8%",
+        }),
+      ],
+    });
+    const result = enforceRound(selfEval, verifyResult, 3, [], 0);
+    assert.equal(result.action, "reject",
+      "should reject when clarification is too short");
+  });
+
+  it("still terminates on second consecutive intent_drift without clarification", () => {
+    const selfEval = makeSelfEvaluation({
+      success: false,
+      output_summary: "Fixed CSS padding again",
+      should_continue: true,
+    });
+    const verifyResult = makeVerificationResult({
+      verdict: "suspect",
+      flags: [
+        makeVerificationFlag({
+          severity: "warn",
+          field: "output_summary",
+          check: "intent_drift",
+          detail: "Declared intent was audit contracts but actual output fixed css — similarity 5%",
+        }),
+      ],
+    });
+    const result = enforceRound(selfEval, verifyResult, 5, [], 1); // 2nd occurrence
+    assert.equal(result.action, "terminate",
+      "should terminate on second drift without clarification");
+  });
+
+  // ── v2.12: Semantic anchor detection ─────────────────────────────────
+
+  it("accepts clarification with constraint ID anchor (c-XXXXXXXX)", () => {
+    const selfEval = makeSelfEvaluation({
+      success: false,
+      output_summary: "Fixed CSS padding",
+      should_continue: true,
+      drift_clarification:
+        "Pivoted because constraint c-a3f2b1c0 (rate limiting) was already satisfied. " +
+        "The CSS fix was higher priority.",
+    });
+    const result = enforceRound(selfEval, makeVerificationResult({
+      verdict: "suspect",
+      flags: [makeVerificationFlag({
+        severity: "warn", field: "output_summary",
+        check: "intent_drift",
+        detail: "Drift detected",
+      })],
+    }), 3, [], 0, false, 0);
+    assert.notEqual(result.action, "reject",
+      "should accept when clarification has constraint ID");
+    assert.equal(result.clarification_accepted, true,
+      "should signal clarification was accepted");
+  });
+
+  it("accepts clarification with sub-goal ID anchor (sg-XXXXXXXX)", () => {
+    const selfEval = makeSelfEvaluation({
+      success: false,
+      output_summary: "Refactored utils",
+      should_continue: true,
+      drift_clarification:
+        "Discovered that sub-goal sg-b5a6c7d8 was blocked by the util structure. " +
+        "Refactored it first so the sub-goal can proceed next round.",
+    });
+    const result = enforceRound(selfEval, makeVerificationResult({
+      verdict: "suspect",
+      flags: [makeVerificationFlag({
+        severity: "warn", field: "output_summary",
+        check: "intent_drift",
+        detail: "Drift detected",
+      })],
+    }), 3, [], 0, false, 0);
+    assert.notEqual(result.action, "reject",
+      "should accept when clarification has sub-goal ID");
+    assert.equal(result.clarification_accepted, true);
+  });
+
+  it("accepts clarification with criterion ID anchor (cr-XXXXXXXX)", () => {
+    const selfEval = makeSelfEvaluation({
+      success: false,
+      output_summary: "Wrote integration tests",
+      should_continue: true,
+      drift_clarification:
+        "Pivoted to write tests because criterion cr-f1e2d3c4 requires " +
+        "integration coverage before the feature is considered done.",
+    });
+    const result = enforceRound(selfEval, makeVerificationResult({
+      verdict: "suspect",
+      flags: [makeVerificationFlag({
+        severity: "warn", field: "output_summary",
+        check: "intent_drift",
+        detail: "Drift detected",
+      })],
+    }), 3, [], 0, false, 0);
+    assert.notEqual(result.action, "reject",
+      "should accept when clarification has criterion ID");
+    assert.equal(result.clarification_accepted, true);
+  });
+
+  it("accepts clarification with file path anchor", () => {
+    const selfEval = makeSelfEvaluation({
+      success: false,
+      output_summary: "Fixed CSS padding",
+      should_continue: true,
+      drift_clarification:
+        "Pivoted because I found a bug in src/components/Login.tsx that " +
+        "was causing the layout issue. Fixed that before continuing auth work.",
+    });
+    const result = enforceRound(selfEval, makeVerificationResult({
+      verdict: "suspect",
+      flags: [makeVerificationFlag({
+        severity: "warn", field: "output_summary",
+        check: "intent_drift",
+        detail: "Drift detected",
+      })],
+    }), 3, [], 0, false, 0);
+    assert.notEqual(result.action, "reject",
+      "should accept when clarification has file path");
+    assert.equal(result.clarification_accepted, true);
+  });
+
+  it("rejects weak clarification (>= 20 chars but no anchors) on first occurrence", () => {
+    const selfEval = makeSelfEvaluation({
+      success: false,
+      output_summary: "Fixed CSS padding",
+      should_continue: true,
+      drift_clarification:
+        "Because I think this is necessary for the current step implementation. " +
+        "The direction change was needed for better results.",
+    });
+    const result = enforceRound(selfEval, makeVerificationResult({
+      verdict: "suspect",
+      flags: [makeVerificationFlag({
+        severity: "warn", field: "output_summary",
+        check: "intent_drift",
+        detail: "Drift detected",
+      })],
+    }), 3, [], 0, false, 0);
+    assert.equal(result.action, "reject",
+      "should reject weak clarification without anchors");
+    assert.equal(result.check, "intent_drift");
+    // fix_instructions should mention the need for concrete references
+    assert.ok(
+      (result.fix_instructions ?? "").includes("drift_clarification"),
+      "fix_instructions should mention drift_clarification",
+    );
+  });
+
+  it("terminates on third consecutive weak clarification (streak >= 3)", () => {
+    const makeDriftEval = () => makeSelfEvaluation({
+      success: false,
+      output_summary: "Did something else",
+      should_continue: true,
+      drift_clarification:
+        "I changed direction because I felt this approach was more optimal " +
+        "for the current implementation requirements. It was the right call.",
+    });
+    const verifyResult = makeVerificationResult({
+      verdict: "suspect",
+      flags: [makeVerificationFlag({
+        severity: "warn", field: "output_summary",
+        check: "intent_drift",
+        detail: "Drift detected",
+      })],
+    });
+
+    // Streak = 0 → first weak clarification → reject only
+    const r0 = enforceRound(makeDriftEval(), verifyResult, 3, [], 0, false, 0);
+    assert.equal(r0.action, "reject",
+      "streak 0 should reject (first weak clarification)");
+
+    // Streak = 1 → second weak clarification → still reject, but with warning
+    const r1 = enforceRound(makeDriftEval(), verifyResult, 4, [], 0, false, 1);
+    assert.equal(r1.action, "reject",
+      "streak 1 should still reject (second weak clarification)");
+    assert.ok(
+      (r1.fix_instructions ?? "").includes("Repeated Weak Clarification"),
+      "fix_instructions should warn about repeated weak clarification on streak >= 2",
+    );
+
+    // Streak = 2 → third weak clarification (2 + 1 = 3 >= max_streak=3) → terminate
+    const r2 = enforceRound(makeDriftEval(), verifyResult, 5, [], 0, false, 2);
+    assert.equal(r2.action, "terminate",
+      "streak 2 + 1 = 3 should terminate (reaches max_streak=3)");
+  });
+
+  it("keeps streak unchanged for substantive clarification", () => {
+    // Even with an existing streak, a strong clarification should be accepted
+    // without resetting the streak (the enforcement gate doesn't track state;
+    // the SessionManager does). But the result should NOT be reject/terminate.
+    const selfEval = makeSelfEvaluation({
+      success: false,
+      output_summary: "Fixed CSS",
+      should_continue: true,
+      drift_clarification:
+        "Pivoted because src/styles/main.css had a layout-breaking regression. " +
+        "The auth work was blocked by this visual bug.",
+    });
+    const result = enforceRound(selfEval, makeVerificationResult({
+      verdict: "suspect",
+      flags: [makeVerificationFlag({
+        severity: "warn", field: "output_summary",
+        check: "intent_drift",
+        detail: "Drift detected",
+      })],
+    }), 3, [], 0, false, 2); // streak = 2
+    assert.notEqual(result.action, "reject",
+      "should accept substantive clarification even with existing streak");
+    assert.equal(result.clarification_accepted, true);
+  });
+
+  it("still rejects when drift_clarification is absent entirely (original behavior)", () => {
+    const selfEval = makeSelfEvaluation({
+      success: false,
+      output_summary: "Fixed CSS padding",
+      should_continue: true,
+      // No drift_clarification at all
+    });
+    const result = enforceRound(selfEval, makeVerificationResult({
+      verdict: "suspect",
+      flags: [makeVerificationFlag({
+        severity: "warn", field: "output_summary",
+        check: "intent_drift",
+        detail: "Drift detected",
+      })],
+    }), 3, [], 0, false, 0);
+    assert.equal(result.action, "reject",
+      "should reject when no clarification provided");
+  });
+
+  it("weak clarification streak escalation disabled when max_streak is 0", () => {
+    // Temporarily override the policy to disable the streak limit
+    resetPolicy();
+    const p = getPolicy();
+    const orig = p.engine.drift_clarification_max_streak;
+    p.engine.drift_clarification_max_streak = 0;
+
+    try {
+      const selfEval = makeSelfEvaluation({
+        success: false,
+        output_summary: "Did something else",
+        should_continue: true,
+        drift_clarification:
+          "I changed direction because I felt this approach was better. " +
+          "No concrete details but the length check still passes.",
+      });
+      const result = enforceRound(selfEval, makeVerificationResult({
+        verdict: "suspect",
+        flags: [makeVerificationFlag({
+          severity: "warn", field: "output_summary",
+          check: "intent_drift",
+          detail: "Drift detected",
+        })],
+      }), 3, [], 0, false, 0);
+      assert.notEqual(result.action, "reject",
+        "should accept when max_streak is 0 (pre-v2.12 behavior)");
+      assert.equal(result.clarification_accepted, true);
+    } finally {
+      p.engine.drift_clarification_max_streak = orig;
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v2.10: Backtrack — safe restore point
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("findSafeRestorePoint", () => {
+  /** Build a clean vault entry for a round. */
+  function cleanRound(rnd: number): VaultEntry {
+    return {
+      task_id: `loop:test:round:${rnd}`,
+      task_type: "round_entry",
+      timestamp: new Date().toISOString(),
+      success: true,
+      task: "test task",
+      output_summary: `Round ${rnd} done`,
+      constraint_violations: [],
+      constraint_violations_entry: [],
+      loop_id: "test",
+      loop_lineage: { round: rnd, task: `Round ${rnd}`, success: true },
+    };
+  }
+
+  function dirtyRound(rnd: number, severity: "warn" | "error" = "error"): VaultEntry {
+    return {
+      task_id: `loop:test:round:${rnd}`,
+      task_type: "round_entry",
+      timestamp: new Date().toISOString(),
+      success: false,
+      task: "test task",
+      output_summary: `Round ${rnd} failed`,
+      constraint_violations: ["bad thing"],
+      constraint_violations_entry: ["bad thing"],
+      loop_id: "test",
+      loop_lineage: { round: rnd, task: `Round ${rnd}`, success: false },
+      verification_flags: [{ check: "test_flag", detail: "error", severity }],
+    };
+  }
+
+  function rejectedRound(rnd: number): VaultEntry {
+    return {
+      task_id: `loop:test:round:${rnd}`,
+      task_type: "round_entry",
+      timestamp: new Date().toISOString(),
+      success: false,
+      task: "test task",
+      output_summary: `Round ${rnd} rejected`,
+      constraint_violations: [],
+      constraint_violations_entry: [],
+      loop_id: "test",
+      loop_lineage: { round: rnd, task: `Round ${rnd}`, success: false },
+    };
+  }
+
+  it("returns the most recent clean round (current - 1)", () => {
+    const vault = [
+      cleanRound(1),
+      cleanRound(2),
+      cleanRound(3),
+      cleanRound(4),
+    ];
+    const result = findSafeRestorePoint(5, vault, 3);
+    assert.ok(result);
+    assert.equal(result!.round, 4);
+    assert.deepEqual(result!.skippedDiscoveries, []);
+  });
+
+  it("skips a dirty round and returns the next clean one", () => {
+    const vault = [
+      cleanRound(1),
+      cleanRound(2),
+      cleanRound(3),       // clean
+      dirtyRound(4),       // dirty — should be skipped
+    ];
+    const result = findSafeRestorePoint(5, vault, 3);
+    assert.ok(result);
+    assert.equal(result!.round, 3, "should skip round 4 and restore to round 3");
+  });
+
+  it("collects discoveries from skipped rounds", () => {
+    const vault = [
+      cleanRound(1),
+      cleanRound(2),
+      cleanRound(3),       // clean — restore target
+      { ...dirtyRound(4), discovered_constraints: ["discovery from r4"] },
+    ];
+    const result = findSafeRestorePoint(5, vault, 3);
+    assert.ok(result);
+    assert.equal(result!.round, 3);
+    assert.ok(result!.skippedDiscoveries.includes("discovery from r4"));
+  });
+
+  it("skips multiple dirty rounds to find a clean one", () => {
+    const vault = [
+      cleanRound(1),
+      cleanRound(2),       // clean — restore target
+      dirtyRound(3),       // dirty
+      rejectedRound(4),    // rejected
+    ];
+    const result = findSafeRestorePoint(5, vault, 3);
+    assert.ok(result);
+    assert.equal(result!.round, 2, "should skip rounds 4 and 3 to reach round 2");
+  });
+
+  it("returns null when maxDepth is exceeded", () => {
+    const vault = [
+      dirtyRound(1),
+      dirtyRound(2),
+      dirtyRound(3),
+      dirtyRound(4),
+    ];
+    const result = findSafeRestorePoint(5, vault, 3);
+    assert.equal(result, null);
+  });
+
+  it("returns null when no entries exist before currentRound", () => {
+    const result = findSafeRestorePoint(1, [], 3);
+    assert.equal(result, null);
+  });
+
+  it("skips rounds with error-level verification flags", () => {
+    const vault = [
+      cleanRound(1),
+      cleanRound(2),       // clean
+      {                       // round 3: has error flag → not clean
+        ...cleanRound(3),
+        success: false,
+        verification_flags: [{ check: "test", detail: "error", severity: "error" }],
+      },
+      cleanRound(4),       // round 4: clean but... wait, this is the one we're at
+    ];
+    // currentRound=5, round 4 is clean, so restore to 4
+    const result = findSafeRestorePoint(5, vault, 3);
+    assert.ok(result);
+    // Round 4 is clean, round 3 is skipped (has errors)
+    // Actually wait - we're scanning backwards from currentRound-1
+    // depth=1: round 4 (clean) → found!
+    assert.equal(result!.round, 4);
+  });
+
+  it("accepts rounds with warn-level flags as clean", () => {
+    const entryWithWarn = {
+      ...cleanRound(3),
+      verification_flags: [{ check: "test_warn", detail: "just a warning", severity: "warn" }],
+    };
+    const vault = [cleanRound(1), cleanRound(2), entryWithWarn, cleanRound(4)];
+    const result = findSafeRestorePoint(5, vault, 3);
+    assert.ok(result);
+    assert.equal(result!.round, 4); // r4 is clean and closer
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v2.10: Build backtrack prompt
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("buildBacktrackPrompt", () => {
+  // ── Round-number exactness (regression guard for ${fromRound} literal bug) ──
+
+  it("renders exact round numbers in all key positions", () => {
+    const prompt = buildBacktrackPrompt(45, 42, "progress_stall", [],
+      ["src/auth.ts"]);
+    verifyBacktrackPrompt(prompt, 45, 42, [
+      "Backtrack",
+      "did not work",
+      "different",
+    ]);
+    // No literal template expressions survive
+    assert.ok(!prompt.includes("${"), "prompt must not contain any ${...} literal");
+  });
+
+  // ── Trigger-rule guidance ────────────────────────────────────────────────
+
+  it("renders stall-specific guidance for progress_stall", () => {
+    const prompt = buildBacktrackPrompt(45, 42, "progress_stall", []);
+    verifyBacktrackPrompt(prompt, 45, 42, [
+      "did not work",
+      "different",
+    ]);
+    assert.ok(!prompt.includes("radically different"),
+      "progress_stall should NOT include terminal-level language");
+  });
+
+  it("renders radical-change guidance for progress_stall_terminal", () => {
+    const prompt = buildBacktrackPrompt(50, 45, "progress_stall_terminal", []);
+    verifyBacktrackPrompt(prompt, 50, 45, [
+      "radically different",
+      "zero forward motion",
+    ]);
+  });
+
+  // ── Discoveries + workspace restore ──────────────────────────────────────
+
+  it("renders preserved discoveries and skipped files", () => {
+    const discoveries = ["SafeERC20 required", "2-day timelock"];
+    const skippedFiles = ["src/auth.ts", "lib/utils.go", "README.md"];
+    const prompt = buildBacktrackPrompt(10, 8, "progress_stall",
+      discoveries, skippedFiles);
+    verifyBacktrackPrompt(prompt, 10, 8, [
+      "Preserved Discoveries",
+      "SafeERC20 required",
+      "2-day timelock",
+      "Workspace Restore",
+      "src/auth.ts",
+      "lib/utils.go",
+      "README.md",
+      "If git is unavailable",
+      "rejected",
+    ]);
+  });
+
+  it("truncates long file lists and omits discovery section when empty", () => {
+    const manyFiles = Array.from({ length: 20 }, (_, i) => `src/file${i}.ts`);
+    const prompt = buildBacktrackPrompt(10, 5, "progress_stall", [],
+      manyFiles);
+    verifyBacktrackPrompt(prompt, 10, 5, [
+      "Workspace Restore",
+      "and 5 more files",
+      "Files modified in skipped rounds",
+    ]);
+    assert.ok(!prompt.includes("Preserved Discoveries"),
+      "should not render discovery section when empty");
   });
 });

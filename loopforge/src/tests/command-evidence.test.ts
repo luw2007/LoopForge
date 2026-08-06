@@ -92,7 +92,7 @@ describe("CommandEvidenceProvider", () => {
 describe("required command verification", () => {
   it("contradicts a success claim when a required command failed", () => {
     const evaluation = makeSelfEvaluation({ success: true });
-    const result = verifySelfEvaluation(evaluation, 1, [], null, null, [{
+    const result = verifySelfEvaluation(evaluation, 1, [], null, [{
       provider: "command:test",
       timestamp: Date.now(),
       files: [],
@@ -111,7 +111,7 @@ describe("required command verification", () => {
 
   it("does not contradict optional command failures", () => {
     const evaluation = makeSelfEvaluation({ success: true });
-    const result = verifySelfEvaluation(evaluation, 1, [], null, null, [{
+    const result = verifySelfEvaluation(evaluation, 1, [], null, [{
       provider: "command:optional",
       timestamp: Date.now(),
       files: [],

@@ -7,6 +7,7 @@
 import type { SessionManager, StartInput } from "./session.js";
 import { buildSelfEvaluation } from "../engine.js";
 import { getPolicyMetrics } from "../policy-metrics.js";
+import { isRecord } from "../token-utils.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Tool schemas (MCP JSON Schema format)
@@ -176,6 +177,62 @@ const TOOL_BASE_SCHEMAS = [
                 required: ["agentId", "subAgentType", "subTask", "resultSummary", "success"],
               },
             },
+            compression_checkpoint: {
+              type: "boolean" as const,
+              description: "Optional. Set true at subtask boundaries to trigger a full-state checkpoint (L2 prompt) that survives rolling-window eviction. The checkpoint label is carried into future prompts.",
+            },
+            checkpoint_label: {
+              type: "string" as const,
+              description: "Optional. Human-readable label for this checkpoint (e.g. 'core-functions-complete'). Only meaningful when compression_checkpoint is true.",
+            },
+            next_action: {
+              type: "string" as const,
+              description: "Optional. What the agent plans to do in the next round. Helps LoopForge detect task drift early by comparing declared intent with actual work.",
+            },
+            completed_subtasks: {
+              type: "array" as const,
+              items: { type: "string" as const },
+              description: "Optional. Sub-tasks completed this round. Matched to previously emerged sub-tasks by description similarity.",
+            },
+            blocked_subtasks: {
+              type: "array" as const,
+              items: { type: "string" as const },
+              description: "Optional. Sub-tasks that are now blocked. Describe what is blocking and why.",
+            },
+            canceled_subtasks: {
+              type: "array" as const,
+              items: { type: "string" as const },
+              description: "Optional. Sub-tasks no longer needed. Removes them from the active sub-goal list.",
+            },
+            stop_reason: {
+              type: "string" as const,
+              enum: ["gave_up", "blocked", "needs_human_input"],
+              description: "Optional. Why the agent is stopping. Only meaningful when should_continue=false and success=false. 'blocked' means work cannot proceed under current constraints.",
+            },
+            prompt_requests: {
+              type: "object" as const,
+              description: "Optional. Information needs for the next round's prompt. Use when you know what context you'll need to succeed in the next round.",
+              properties: {
+                emphasize: {
+                  type: "array" as const,
+                  items: { type: "string" as const },
+                  description: "Constraints, discoveries, or decisions that need emphasis in the next prompt. Matched by meaning — not exact text. Matched items appear in a 'Critical Context' section. Max 5 entries. Pure reordering — no token overhead.",
+                },
+                expand: {
+                  type: "array" as const,
+                  items: {
+                    type: "string" as const,
+                    enum: ["milestones", "sub_goals", "constraint_lifecycle", "agent_trust", "progress", "loop_synthesis"],
+                  },
+                  description: "Sections to expand to full detail in the next prompt. Useful when you need full context on a specific area (e.g. full sub-goal dashboard when replanning). L1 max 1 section. L2 already expanded — redundant. L0 ignored.",
+                },
+                confusion_points: {
+                  type: "array" as const,
+                  items: { type: "string" as const },
+                  description: "Things you're confused about. Rendered at the TOP of the next prompt before the objective. Max 3 entries, each ≤ 200 chars recommended. Be specific — 'I don't understand why milestone 3 is marked complete when phase 2 appears unfinished.'",
+                },
+              },
+            },
           },
         },
       },
@@ -295,9 +352,10 @@ const ADVANCE_OUTPUT_SCHEMA: JsonSchema = {
     roundId: { type: ["string", "null"] },
     prompt: { type: ["string", "null"] },
     stopReason: { type: "string" },
+    stopDetail: { type: "string", description: "Human-readable context for why the loop stopped. Provides facts without prescribing a specific agent action." },
     level: { type: "string" },
     roundSuccess: { type: "boolean" },
-    enforcementAction: { enum: ["accept", "reject", "terminate"] },
+    enforcementAction: { enum: ["accept", "reject", "terminate", "backtrack"] },
     enforcementReason: { type: "string" },
     warnings: { type: "array", items: { type: "string" } },
   },
@@ -377,10 +435,6 @@ const TOOL_OUTPUT_SCHEMAS: Record<string, JsonSchema> = {
     additionalProperties: true,
   },
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 
 function closeObjectSchemas(schema: JsonSchema): JsonSchema {
   const result: JsonSchema = { ...schema };
@@ -556,11 +610,6 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
       lease: mgr.getLeaseStatus(session.loopId),
       metrics: {
         vaultWriteErrors: metrics.vaultWriteErrors,
-        vaultWriteBytes: metrics.vaultWriteBytes,
-        feedbackBufferFlushes: metrics.feedbackBufferFlushes,
-        feedbackBufferMaxSize: metrics.feedbackBufferMaxSize,
-        hydrateCacheMisses: metrics.hydrateCacheMisses,
-        silentAnalysisErrors: metrics.silentAnalysisErrors,
         policy: getPolicyMetrics(session.loopId),
       },
     };

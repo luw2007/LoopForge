@@ -5,9 +5,10 @@
  * feedback storage. The committed feedback embeds the decision so replay after
  * a process crash is idempotent.
  */
-import { diffSnapshotCollections, extractFilesFromSnapshots, } from "./evidence-provider.js";
+import { diffSnapshotCollections } from "./evidence-provider.js";
 import { RoundCoordinator, } from "./round-coordinator.js";
-import { logEvent, startSpan } from "./observability.js";
+import { logEvent } from "./observability.js";
+import { isRecord } from "./token-utils.js";
 import { policyMetrics } from "./policy-metrics.js";
 import { VaultRoundCommitStore } from "./storage.js";
 export const ROUND_TRANSACTION_SCHEMA_VERSION = 1;
@@ -57,13 +58,10 @@ export function prepareRejectedAttempt(rejected, promptArtifact) {
         updatedAt: Date.now(),
     };
 }
-function isRecord(value) {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 function isProcessResult(value) {
     if (!isRecord(value))
         return false;
-    return ["continue", "stop", "reject", "terminate"].includes(String(value.action)) && Array.isArray(value.verificationFlags);
+    return ["continue", "stop", "reject", "terminate", "backtrack"].includes(String(value.action)) && Array.isArray(value.verificationFlags);
 }
 function parseProviderSnapshots(value) {
     if (!Array.isArray(value))
@@ -147,19 +145,8 @@ export class RoundTransactionCoordinator {
     }
     process(input) {
         const { snapshot } = input;
-        const span = startSpan("round.transaction", {
-            loopId: snapshot.loopId,
-            round: snapshot.round,
-            roundId: snapshot.roundId,
-            attempt: snapshot.attempt,
-        });
         const finish = (outcome) => {
             policyMetrics.recordRound(snapshot.loopId, outcome.result, outcome.replayed);
-            span.end("ok", {
-                action: outcome.result.action,
-                replayed: outcome.replayed,
-                phase: outcome.snapshot.phase,
-            });
             return outcome;
         };
         try {
@@ -190,10 +177,10 @@ export class RoundTransactionCoordinator {
                 extractionSucceeded: input.extractionSucceeded,
                 lastSelfEval: input.lastSelfEval,
                 consecutiveRejections: input.consecutiveRejections,
-                runtimeFilesChanged: extractFilesFromSnapshots(roundEvidence),
                 evidenceSnapshots: roundEvidence,
                 successTrajectory: input.successTrajectory,
-            });
+                backtrackSkippedFiles: input.backtrackSkippedFiles,
+            }, input.driftClarificationStreak ?? 0);
             const evaluated = {
                 ...snapshot,
                 attempt,
@@ -237,27 +224,19 @@ export class RoundTransactionCoordinator {
             return finish({ snapshot: committedSnapshot, result, replayed: false });
         }
         catch (error) {
-            span.end("error", { error: String(error) });
             throw error;
         }
     }
     /** Recover an already committed decision without evaluating or writing. */
     recover(snapshot) {
-        const span = startSpan("round.transaction.recover", {
-            loopId: snapshot.loopId,
-            round: snapshot.round,
-            roundId: snapshot.roundId,
-        });
         try {
             const outcome = this.readCommitted(snapshot);
             if (outcome) {
                 policyMetrics.recordRound(snapshot.loopId, outcome.result, true);
             }
-            span.end("ok", { recovered: outcome !== null });
             return outcome;
         }
         catch (error) {
-            span.end("error", { error: String(error) });
             throw error;
         }
     }

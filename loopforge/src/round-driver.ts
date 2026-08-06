@@ -34,6 +34,7 @@ export interface PreparedRound {
   evidenceBaseline: ProviderSnapshot[];
   snapshot: RoundTransactionSnapshot;
   stateFileContent?: string;
+  warnings?: string[];
 }
 
 export interface CompleteRoundInput {
@@ -46,6 +47,10 @@ export interface CompleteRoundInput {
   lastSelfEval?: SelfEvaluation;
   consecutiveRejections: number;
   successTrajectory: boolean[];
+  /** v2.12: Current clarification streak for R7 escalation. */
+  driftClarificationStreak?: number;
+  /** v2.13: Files from skipped backtrack rounds for restore check. */
+  backtrackSkippedFiles?: string[];
 }
 
 export interface CompletedRound {
@@ -128,6 +133,7 @@ export class RoundDriver {
       evidenceBaseline: rejected.beforeEvidence,
       snapshot,
       stateFileContent: response.state_file_content,
+      warnings: response.warnings,
     };
   }
 
@@ -151,6 +157,7 @@ export class RoundDriver {
       evidenceBaseline,
       snapshot,
       stateFileContent: response.state_file_content,
+      warnings: response.warnings,
     };
   }
 
@@ -170,6 +177,8 @@ export class RoundDriver {
       consecutiveRejections: input.consecutiveRejections,
       successTrajectory: input.successTrajectory,
       actualEvidence,
+      driftClarificationStreak: input.driftClarificationStreak,
+      backtrackSkippedFiles: input.backtrackSkippedFiles,
     });
     return { outcome, actualEvidence };
   }

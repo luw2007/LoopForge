@@ -13,7 +13,6 @@ export declare class ReplayBackend {
         end?: number;
     }): VaultEntry[];
     timeline(loopId: string): Record<string, unknown>[];
-    diff(loopId: string, roundA: number, roundB: number): Record<string, unknown>;
     private maxRound;
 }
 //# sourceMappingURL=replay.d.ts.map

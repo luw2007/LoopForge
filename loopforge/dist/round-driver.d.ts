@@ -17,6 +17,7 @@ export interface PreparedRound {
     evidenceBaseline: ProviderSnapshot[];
     snapshot: RoundTransactionSnapshot;
     stateFileContent?: string;
+    warnings?: string[];
 }
 export interface CompleteRoundInput {
     snapshot: RoundTransactionSnapshot;
@@ -28,6 +29,10 @@ export interface CompleteRoundInput {
     lastSelfEval?: SelfEvaluation;
     consecutiveRejections: number;
     successTrajectory: boolean[];
+    /** v2.12: Current clarification streak for R7 escalation. */
+    driftClarificationStreak?: number;
+    /** v2.13: Files from skipped backtrack rounds for restore check. */
+    backtrackSkippedFiles?: string[];
 }
 export interface CompletedRound {
     outcome: RoundTransactionOutcome;

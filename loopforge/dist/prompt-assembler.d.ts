@@ -5,7 +5,7 @@
  * are never truncated; budgets are soft and overflow is recorded.
  */
 import type { CanonicalLoopState } from "./canonical-state.js";
-import type { PromptArtifact } from "./protocol.js";
+import type { PromptArtifact, PromptRequests } from "./protocol.js";
 import type { PromptLevel, PromptLevelReason } from "./prompt-policy.js";
 export declare const PROMPT_ARTIFACT_SCHEMA_VERSION: 1;
 export declare const BASE_PROMPT_VERSION = "2.0.0";
@@ -25,6 +25,8 @@ export interface PromptAssemblyInput {
     attempt?: number;
     selfEvaluationBlock: string;
     fullStateMarkdown?: string;
+    /** v2.9: Model's information needs for this prompt. L0: ignored. */
+    promptRequests?: PromptRequests;
 }
 export declare function assemblePromptArtifact(input: PromptAssemblyInput): PromptArtifact;
 //# sourceMappingURL=prompt-assembler.d.ts.map
